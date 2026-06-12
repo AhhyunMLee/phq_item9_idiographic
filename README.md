@@ -11,10 +11,10 @@ This repository contains the final R code for the PHQ-9 item 9 prediction projec
 Use the single analysis script:
 
 ```r
-source("PHQ9_Item9_Predidction.R")
+source("si_idiographic_2026.R")
 ```
 
-The filename intentionally matches the current project file. If you rename the file, update the `source()` command accordingly.
+If you rename the file, update the `source()` command accordingly.
 
 ## Expected Folder Layout
 
@@ -32,12 +32,12 @@ If the script is run from `1. Code`, it automatically treats the parent folder a
 
 ```r
 Sys.setenv(SI_PROJECT_BASE = "/path/to/SI_Prediction")
-source("PHQ9_Item9_Predidction.R")
+source("si_idiographic_2026.R")
 ```
 
 ## Run Flags
 
-The script is submitted with all optional analyses turned off. To run a section, edit the `RUN_*` flags at the top of `PHQ9_Item9_Predidction.R` before sourcing the file.
+The script is submitted with all optional analyses turned off. To run a section, set the `RUN_*` flags before sourcing the file, or edit the defaults at the top of `si_idiographic_2026.R`.
 
 For manuscript output generation using existing cleaned data and cached model results, use:
 
@@ -101,9 +101,7 @@ Expected final report files include:
 ```text
 Table1_demographics.csv
 Table2_continuous_model_results_main.csv
-Table2_continuous_model_results_main.docx
 Table3_hurdle_model_results_main.csv
-Table3_hurdle_model_results_main.docx
 Table4_feature_importance_shap.csv
 feature_importance_all_in_one_aggregate.csv
 Figure_hurdle_model_performance_main.png
@@ -125,7 +123,7 @@ RUN_ALL_PT_HURDLE_TIMESERIES <- TRUE
 
 ## Feature Importance
 
-Exploratory feature-importance summaries use mean absolute approximate SHAP values among successful models:
+Exploratory feature-importance summaries use mean absolute approximate SHAP values among successful models. These outputs are intended as descriptive follow-up/supplemental results, not primary confirmatory evidence:
 
 - continuous models with `R² > 0`;
 - hurdle models with `AUC > 0.5`.
@@ -168,16 +166,13 @@ Then run:
 
 ```r
 RUN_BASE_RATE_ANALYSIS <- TRUE
-source("PHQ9_Item9_Predidction.R")
+source("si_idiographic_2026.R")
 ```
 
 This optional section writes:
 
 ```text
-4. Results/report/perperson_baserate.csv
-4. Results/report/baserate_predictability_results.csv
-4. Results/report/Figure_base_rate_histogram.png
-4. Results/report/Figure_base_rate_vs_predictability.png
+4. Results/report/base_rate_analysis.csv
 ```
 
 ## Privacy And GitHub Upload
@@ -199,11 +194,11 @@ Do not commit:
 Recommended public files:
 
 ```text
-PHQ9_Item9_Predidction.R
-PHQ9_Item9_Prediction.Rproj
+si_idiographic_2026.R
+si_idiographic_2026.Rproj
 README.md
 ```
 
 ## Reproducibility Notes
 
-The script installs missing R packages when needed. For a clean rerun on another machine, make sure the expected folder layout exists and set `SI_PROJECT_BASE` if the script is not run from `1. Code`.
+The script checks for required R packages and stops with an install command if any are missing. For a clean rerun on another machine, make sure the expected folder layout exists and set `SI_PROJECT_BASE` if the script is not run from `1. Code`.

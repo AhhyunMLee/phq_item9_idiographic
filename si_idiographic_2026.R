@@ -1,5 +1,5 @@
 ################################################################################
-# SI Prediction Project - Final Single R Script
+# SI Idiographic Prediction Project - Final Single R Script
 #
 # Folder layout expected under BASE_PATH:
 #   1. Code
@@ -7,18 +7,45 @@
 #   3. Cleaned data
 #   4. Results
 #
-# Edit the RUN_* flags below to choose which sections to run.
+# To run from another R session, set flags before sourcing this file, for example:
+#   Sys.setenv(SI_PROJECT_BASE = "/path/to/SI_Prediction")
+#   RUN_MAIN_PIPELINE <- TRUE
+#   source("si_idiographic_2026.R")
 ################################################################################
 
 set_default_flag <- function(name, value) {
+  if (exists(name, envir = .GlobalEnv, inherits = FALSE)) {
+    return(get(name, envir = .GlobalEnv, inherits = FALSE))
+  }
   assign(name, value, envir = .GlobalEnv)
   value
 }
 
+require_packages_or_stop <- function(packages, context = "this analysis") {
+  missing <- packages[!(packages %in% rownames(installed.packages()))]
+  if (length(missing)) {
+    stop(
+      sprintf(
+        "Missing R packages required for %s: %s\nInstall them with:\ninstall.packages(c(%s))",
+        context,
+        paste(missing, collapse = ", "),
+        paste(sprintf('"%s"', missing), collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+# Create directories quietly, including missing parent folders.
+make_dirs <- function(...) {
+  invisible(lapply(c(...), dir.create, showWarnings = FALSE, recursive = TRUE))
+}
+
+# Public run flags. Existing values set before source() are preserved.
 RUN_DATA_CLEANING <- set_default_flag("RUN_DATA_CLEANING", FALSE)
 RUN_MAIN_PIPELINE <- set_default_flag("RUN_MAIN_PIPELINE", FALSE)
 RUN_FINAL_MANUSCRIPT_OUTPUTS <- set_default_flag("RUN_FINAL_MANUSCRIPT_OUTPUTS", FALSE)
-# TRUE = run exploratory SHAP feature importance and export the combined summary CSV.
 RUN_FEATURE_IMPORTANCE <- set_default_flag("RUN_FEATURE_IMPORTANCE", FALSE)
 RUN_ALL_PT_CONTINUOUS_TIMESERIES <- set_default_flag("RUN_ALL_PT_CONTINUOUS_TIMESERIES", FALSE)
 RUN_ALL_PT_HURDLE_TIMESERIES <- set_default_flag("RUN_ALL_PT_HURDLE_TIMESERIES", FALSE)
@@ -26,7 +53,10 @@ KEEP_FEATURE_IMPORTANCE_DETAILS <- set_default_flag("KEEP_FEATURE_IMPORTANCE_DET
 RUN_EXTRA_DIAGNOSTIC_FIGURES <- set_default_flag("RUN_EXTRA_DIAGNOSTIC_FIGURES", FALSE)
 RUN_BASE_RATE_ANALYSIS <- set_default_flag("RUN_BASE_RATE_ANALYSIS", FALSE)
 
-PROJECT_DIR <- tryCatch(dirname(normalizePath(sys.frame(1)$ofile)), error = function(e) getwd())
+PROJECT_DIR <- tryCatch(
+  dirname(normalizePath(sys.frame(1)$ofile)),
+  error = function(e) getwd()
+)
 setwd(PROJECT_DIR)
 cat("\nSI Prediction Project - Final Single R Script\n")
 cat(sprintf("Code directory: %s\n", PROJECT_DIR))
@@ -143,7 +173,7 @@ cat("\n===== OPTIONAL SECTION: DATA CLEANING =====\n")
 # Resumable: each participant writes its own per-uid file; finished ones skip.
 ################################################################################
 
-if (!requireNamespace("pbmcapply", quietly = TRUE)) install.packages("pbmcapply")
+require_packages_or_stop("pbmcapply", "data cleaning")
 suppressPackageStartupMessages({
   library(data.table); library(stringr); library(lubridate); library(parallel)
   library(pbmcapply)
@@ -186,10 +216,7 @@ RESULTS_ROOT_DIR <- file.path(BASE_PATH, "4. Results")
 if (!exists("results_dir", inherits = TRUE)) {
   results_dir <- file.path(RESULTS_ROOT_DIR, "report")
 }
-dir.create(CLEAN_DATA_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(CLEAN_SENSOR_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(CLEAN_UID_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+make_dirs(CLEAN_DATA_DIR, CLEAN_SENSOR_DIR, CLEAN_UID_DIR, results_dir)
 cat(sprintf("Using BASE_PATH: %s\n", BASE_PATH))
 
 normalize_uid <- function(x) {
@@ -272,7 +299,7 @@ read_acc <- function(fp) {
 }
 
 output_dir <- file.path(CLEAN_UID_DIR, "acc_per_uid")
-dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+make_dirs(output_dir)
 WINDOWS <- list(hr1 = 3600, hr4 = 14400, day1 = 86400, day7 = 604800)
 
 # --- per-participant worker -----------------------------------------------------
@@ -372,7 +399,7 @@ data.table::setDTthreads(0)   # restore default threading
 # passive compliance criteria.
 ################################################################################
 
-if (!requireNamespace("pbmcapply", quietly = TRUE)) install.packages("pbmcapply")
+require_packages_or_stop("pbmcapply", "data cleaning")
 suppressPackageStartupMessages({
   library(data.table); library(stringr); library(lubridate)
   library(parallel);   library(pbmcapply); library(geosphere)
@@ -762,7 +789,7 @@ process_one <- function(fp, spec) {
     if (!nrow(dt)) return(paste("NORANGE", uid_this))
     data.table::setkey(dt, day)
     res <- compute_indices(as.numeric(dt$day), dt$signal, ema_this, spec$epoch_sec)
-    dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+    make_dirs(out_dir)
     data.table::fwrite(res, out_path)
     paste("DONE", uid_this, nrow(ema_this))
   }, error = function(e) paste("ERROR", uid_this, conditionMessage(e)))
@@ -846,7 +873,7 @@ inspect_sensor_input_files <- function(folders = c("sleep", "smslog", "calllog")
   })
   res <- data.table::rbindlist(out, use.names = TRUE, fill = TRUE)
   out_csv <- file.path(results_dir, "sensor_input_file_inspection.csv")
-  dir.create(dirname(out_csv), showWarnings = FALSE, recursive = TRUE)
+  make_dirs(dirname(out_csv))
   data.table::fwrite(res, out_csv)
   invisible(res)
 }
@@ -1345,7 +1372,7 @@ compute_raw_passive_compliance <- function(expected_days,
   if (file.exists(outfile) && !force) {
     return(data.table::fread(outfile, colClasses = list(character = "uid")))
   }
-  dir.create(dirname(outfile), showWarnings = FALSE, recursive = TRUE)
+  make_dirs(dirname(outfile))
   expected_days[, uid := normalize_uid(uid)]
   expected_days <- unique(expected_days[!is.na(uid) & !is.na(date), .(uid, date)])
   uid_expected <- expected_days[, .(expected_days = data.table::uniqueN(date)), by = uid]
@@ -1522,7 +1549,7 @@ apply_inclusion_criteria <- function(
   cat(sprintf("Saved keystone SI-count summary: %s\n", si_keystone_path))
   cat(sprintf("Saved keystone SI-count reason breakdown: %s\n", si_reason_path))
   report_path <- file.path(results_dir, "inclusion_participant_report.csv")
-  dir.create(dirname(report_path), showWarnings = FALSE, recursive = TRUE)
+  make_dirs(dirname(report_path))
   data.table::fwrite(inclusion_report, report_path)
   cat(sprintf("Saved inclusion participant report: %s\n", report_path))
   sensor_report_path <- file.path(results_dir, "passive_sensor_availability_report.csv")
@@ -1569,7 +1596,7 @@ make_sensor_quality_distributions <- function(
     warning("scales is not installed; skipping sensor quality distribution plots.")
     return(invisible(NULL))
   }
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
   
   d <- data.table::fread(file.path(CLEAN_DATA_DIR, infile), colClasses = list(character = "uid"))
   d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
@@ -1700,7 +1727,7 @@ make_dynamic_index_quality_distributions <- function(
     warning("scales is not installed; skipping dynamic-index QA plots.")
     return(invisible(NULL))
   }
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
   d <- data.table::fread(file.path(CLEAN_DATA_DIR, infile), colClasses = list(character = "uid"))
   d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
   
@@ -1806,7 +1833,7 @@ inspect_dynamic_index_merge <- function(
     feature_file = "all_features_combined.csv",
     out_dir = results_dir) {
   
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
   feature_path <- file.path(CLEAN_DATA_DIR, feature_file)
   if (!file.exists(feature_path)) stop(sprintf("Missing feature file: %s", feature_path))
   
@@ -1930,16 +1957,18 @@ report_all_pt_continuous_dir <- file.path(report_all_pt_dir, "continuous")
 report_all_pt_hurdle_dir <- file.path(report_all_pt_dir, "hurdle")
 model_config_cache_dir <- file.path(RESULTS_ROOT_DIR, "model_config_cache")
 ema_features_path <- file.path(CLEAN_DATA_DIR, "ema_features.csv")
-dir.create(CLEAN_DATA_DIR, showWarnings=FALSE, recursive=TRUE)
-dir.create(CLEAN_SENSOR_DIR, showWarnings=FALSE, recursive=TRUE)
-dir.create(CLEAN_UID_DIR, showWarnings=FALSE, recursive=TRUE)
-dir.create(results_dir, showWarnings=FALSE, recursive=TRUE)
-dir.create(plots_dir,   showWarnings=FALSE, recursive=TRUE)
-dir.create(report_dir, showWarnings=FALSE, recursive=TRUE)
-dir.create(report_all_pt_dir, showWarnings=FALSE, recursive=TRUE)
-dir.create(report_all_pt_continuous_dir, showWarnings=FALSE, recursive=TRUE)
-dir.create(report_all_pt_hurdle_dir, showWarnings=FALSE, recursive=TRUE)
-dir.create(model_config_cache_dir, showWarnings=FALSE, recursive=TRUE)
+make_dirs(
+  CLEAN_DATA_DIR,
+  CLEAN_SENSOR_DIR,
+  CLEAN_UID_DIR,
+  results_dir,
+  plots_dir,
+  report_dir,
+  report_all_pt_dir,
+  report_all_pt_continuous_dir,
+  report_all_pt_hurdle_dir,
+  model_config_cache_dir
+)
 # ==============================================================================
 # SECTION 0: PACKAGES + SHARED HELPERS
 # ==============================================================================
@@ -1948,17 +1977,16 @@ required_packages <- c(
   "TSEntropies", "bit64", "parallel", "future.apply", "furrr", "progress",
   "RANN", "geosphere", "caret", "randomForest", "foreach", "doParallel",
   "effsize", "patchwork", "gbm", "pROC",
-  "ggplot2", "ggridges", "scales", "flextable", "officer"
+  "ggplot2", "ggridges", "scales"
 )
-new_pkgs <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
-if (length(new_pkgs)) install.packages(new_pkgs)
+require_packages_or_stop(required_packages, "the main prediction pipeline")
 suppressPackageStartupMessages({
   library(tidyverse); library(data.table); library(lubridate); library(stringr)
   library(tidyr); library(TSEntropies); library(bit64); library(progress)
   library(future.apply); library(furrr); library(RANN); library(geosphere)
   library(caret); library(randomForest); library(foreach); library(doParallel)
   library(effsize); library(patchwork); library(gbm); library(pROC)
-  library(ggplot2); library(ggridges); library(scales); library(flextable); library(officer)
+  library(ggplot2); library(ggridges); library(scales)
 })
 setwd(BASE_PATH)
 # Per-person min-max scaling
@@ -2020,7 +2048,7 @@ run_sensor_pipeline <- function(file_list, ema_lookup, sensor_tag,
                                                hr4  = 14400,
                                                day1 = 86400,
                                                day7 = 604800)) {
-  dir.create(output_dir, showWarnings = FALSE)
+  make_dirs(output_dir)
   pb <- progress::progress_bar$new(
     format = "  [:bar] :current/:total | :uid | eta: :eta",
     total = length(file_list), clear = FALSE, width = 90)
@@ -3098,49 +3126,8 @@ make_predictive_performance_tables <- function(combined, baseline_tests = NULL,
   hurdle_csv <- file.path(report_dir, sprintf("Table3_hurdle_model_results_%s.csv", variant_name))
   write.csv(cont_report_table, cont_csv, row.names = FALSE)
   write.csv(hurdle_report_table, hurdle_csv, row.names = FALSE)
-  ft_cont <- flextable::flextable(cont_report_table) %>%
-    flextable::theme_booktabs() %>%
-    flextable::bold(part = "header") %>%
-    flextable::autofit() %>%
-    flextable::set_caption("Table 2. Idiographic continuous-model performance by feature configuration")
-  best_cont <- list(
-    `% r>0` = which.max(cont_raw$cor_median),
-    `R², median [IQR]` = which.max(cont_raw$r2_median),
-    `MAE, median [IQR]` = which.min(cont_raw$mae_median),
-    `RMSE, median [IQR]` = which.min(cont_raw$rmse_median)
-  )
-  for (jj in names(best_cont)) ft_cont <- flextable::bold(ft_cont, i = best_cont[[jj]], j = jj, bold = TRUE)
-  ft_hurdle <- NULL
-  if (nrow(hurdle_report_table)) {
-    ft_hurdle <- flextable::flextable(hurdle_report_table) %>%
-      flextable::theme_booktabs() %>%
-      flextable::bold(part = "header") %>%
-      flextable::autofit() %>%
-      flextable::set_caption("Table 3. Idiographic hurdle-model performance by feature configuration")
-    best_hurdle <- list(
-      `AUC, median [IQR]` = which.max(hurdle_raw$auc_median),
-      `% AUC>0.5` = which.max(as.numeric(gsub("%", "", hurdle_raw$`% AUC>0.5`))),
-      `Sensitivity, median [IQR]` = which.max(hurdle_raw$sensitivity_median),
-      `Specificity, median [IQR]` = which.max(hurdle_raw$specificity_median),
-      `Balanced acc., median [IQR]` = which.max(hurdle_raw$balanced_acc_median),
-      `MAE, median [IQR]` = which.min(hurdle_raw$mae_median)
-    )
-    for (jj in names(best_hurdle)) ft_hurdle <- flextable::bold(ft_hurdle, i = best_hurdle[[jj]], j = jj, bold = TRUE)
-  }
-  cont_docx <- file.path(report_dir, sprintf("Table2_continuous_model_results_%s.docx", variant_name))
-  hurdle_docx <- file.path(report_dir, sprintf("Table3_hurdle_model_results_%s.docx", variant_name))
-  doc_cont <- officer::read_docx() %>%
-    officer::body_add_par("Table 2. Continuous Model Predictive Performance", style = "heading 1") %>%
-    flextable::body_add_flextable(ft_cont)
-  print(doc_cont, target = cont_docx)
-  if (!is.null(ft_hurdle)) {
-    doc_hurdle <- officer::read_docx() %>%
-      officer::body_add_par("Table 3. Hurdle Model Predictive Performance", style = "heading 1") %>%
-      flextable::body_add_flextable(ft_hurdle)
-    print(doc_hurdle, target = hurdle_docx)
-  }
-  cat(sprintf("Saved report continuous table: %s\n", cont_docx))
-  if (!is.null(ft_hurdle)) cat(sprintf("Saved report hurdle table: %s\n", hurdle_docx))
+  cat(sprintf("Saved report continuous table CSV: %s\n", cont_csv))
+  cat(sprintf("Saved report hurdle table CSV: %s\n", hurdle_csv))
   invisible(perf_table)
 }
 
@@ -3663,7 +3650,7 @@ summarize_continuous_prediction_panel <- function(pd) {
 make_continuous_timeseries_for_participant <- function(uid, cv_params = CV_VARIANTS$main,
                                                        out_dir = report_all_pt_continuous_dir,
                                                        overwrite = TRUE) {
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
   uid <- stringr::str_pad(as.character(uid), width = 4, pad = "0")
   out <- file.path(out_dir, sprintf("F3_continuous_timeseries_PT%s.png", uid))
   if (file.exists(out) && !isTRUE(overwrite)) {
@@ -3763,7 +3750,7 @@ make_continuous_timeseries_all_participants <- function(combined, variant_name =
     uids <- intersect(uids, participant_ids)
   }
   out_dir <- report_all_pt_continuous_dir
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
   cat(sprintf("Saving continuous time-series plots for %d participants to: %s\n", length(uids), out_dir))
   outs <- lapply(uids, function(u) {
     tryCatch(make_continuous_timeseries_for_participant(u, cv_params, out_dir, overwrite = overwrite),
@@ -3780,7 +3767,7 @@ make_continuous_timeseries_all_participants <- function(combined, variant_name =
 make_hurdle_timeseries_for_participant <- function(uid, cv_params = CV_VARIANTS$main,
                                                    out_dir = report_all_pt_hurdle_dir,
                                                    overwrite = TRUE) {
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
   uid <- stringr::str_pad(as.character(uid), width = 4, pad = "0")
   out <- file.path(out_dir, sprintf("F3_hurdle_timeseries_PT%s.png", uid))
   if (file.exists(out) && !isTRUE(overwrite)) {
@@ -3880,7 +3867,7 @@ make_hurdle_timeseries_all_participants <- function(combined, variant_name = "ma
     uids <- intersect(uids, participant_ids)
   }
   out_dir <- report_all_pt_hurdle_dir
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
   cat(sprintf("Saving hurdle time-series plots for %d participants to: %s\n", length(uids), out_dir))
   outs <- lapply(uids, function(u) {
     tryCatch(make_hurdle_timeseries_for_participant(u, cv_params, out_dir, overwrite = overwrite),
@@ -4188,10 +4175,12 @@ if (isTRUE(RERUN_F2_REFERENCE_STYLE)) {
 cat(sprintf("   • Table 1:       %s\n", file.path(results_dir, "Table1_demographics.csv")))
 
 build_final_report_folder <- function() {
-  dir.create(report_dir, showWarnings = FALSE, recursive = TRUE)
-  dir.create(report_all_pt_dir, showWarnings = FALSE, recursive = TRUE)
-  dir.create(report_all_pt_continuous_dir, showWarnings = FALSE, recursive = TRUE)
-  dir.create(report_all_pt_hurdle_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(
+    report_dir,
+    report_all_pt_dir,
+    report_all_pt_continuous_dir,
+    report_all_pt_hurdle_dir
+  )
 
   copy_if_exists <- function(from, to) {
     if (file.exists(from)) {
@@ -4218,8 +4207,11 @@ build_final_report_folder <- function() {
     file.path(report_dir, "baseline_comparison_tests_main.csv"),
     file.path(report_dir, "continuous_model_failure_diagnostic_by_config_main.csv"),
     file.path(report_dir, "continuous_model_failure_diagnostic_by_participant_main.csv"),
+    file.path(report_dir, "Table1_demographics_PT143.png"),
     file.path(report_dir, "Table2_predictive_performance_main.csv"),
     file.path(report_dir, "Table2_predictive_performance_main.docx"),
+    file.path(report_dir, "Table2_continuous_model_results_main.docx"),
+    file.path(report_dir, "Table3_hurdle_model_results_main.docx"),
     file.path(plots_dir, "F1_model_performance_main.png"),
     file.path(plots_dir, "F2_withinperson_continuous_main.png"),
     file.path(plots_dir, "F2_withinperson_hurdle_main.png"),
@@ -4245,11 +4237,6 @@ build_final_report_folder <- function() {
   } else {
     warning("table2_predictive_performance_main does not exist; result CSV tables were not rebuilt.")
   }
-  copy_if_exists(file.path(report_dir, "Table2_continuous_model_results_main.docx"),
-                 file.path(report_dir, "Table2_continuous_model_results_main.docx"))
-  copy_if_exists(file.path(report_dir, "Table3_hurdle_model_results_main.docx"),
-                 file.path(report_dir, "Table3_hurdle_model_results_main.docx"))
-
   if (!file.exists(file.path(report_dir, "Figure_hurdle_model_performance_main.png"))) {
     warning("Missing expected hurdle model figure: Figure_hurdle_model_performance_main.png")
   }
@@ -4292,24 +4279,24 @@ build_final_report_folder <- function() {
   manifest <- data.frame(
     item = c(
       "Demographic table CSV",
-      "Continuous model results DOCX",
-      "Hurdle model results DOCX",
+      "Continuous model results CSV",
+      "Hurdle model results CSV",
       "Hurdle model figure",
       "All participant continuous time-series folder",
       "All participant hurdle time-series folder"
     ),
     path = c(
       file.path(report_dir, "Table1_demographics.csv"),
-      file.path(report_dir, "Table2_continuous_model_results_main.docx"),
-      file.path(report_dir, "Table3_hurdle_model_results_main.docx"),
+      file.path(report_dir, "Table2_continuous_model_results_main.csv"),
+      file.path(report_dir, "Table3_hurdle_model_results_main.csv"),
       file.path(report_dir, "Figure_hurdle_model_performance_main.png"),
       report_all_pt_continuous_dir,
       report_all_pt_hurdle_dir
     ),
     exists = c(
       file.exists(file.path(report_dir, "Table1_demographics.csv")),
-      file.exists(file.path(report_dir, "Table2_continuous_model_results_main.docx")),
-      file.exists(file.path(report_dir, "Table3_hurdle_model_results_main.docx")),
+      file.exists(file.path(report_dir, "Table2_continuous_model_results_main.csv")),
+      file.exists(file.path(report_dir, "Table3_hurdle_model_results_main.csv")),
       file.exists(file.path(report_dir, "Figure_hurdle_model_performance_main.png")),
       dir.exists(report_all_pt_continuous_dir),
       dir.exists(report_all_pt_hurdle_dir)
@@ -4368,11 +4355,10 @@ OUT_DIR <- if (isTRUE(KEEP_FEATURE_IMPORTANCE_DETAILS)) {
 }
 FEATURE_IMPORTANCE_WORK_DIR <- OUT_DIR
 STATUS_FILE <- file.path(OUT_DIR, "exploratory_feature_importance_status.csv")
-dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+make_dirs(OUT_DIR)
 
 required_packages <- c("data.table", "dplyr", "stringr", "caret", "randomForest", "ggplot2")
-new_pkgs <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
-if (length(new_pkgs)) install.packages(new_pkgs)
+require_packages_or_stop(required_packages, "feature importance")
 suppressPackageStartupMessages({
   library(data.table)
   library(dplyr)
@@ -4756,26 +4742,6 @@ summarize_importance <- function(importance, model_type, config, criterion_label
   }))
   write.csv(winners, file.path(OUT_DIR, sprintf("winners_%s.csv", out_stub)), row.names = FALSE)
 
-  plot_df <- summaries$feature %>%
-    slice_head(n = 25) %>%
-    mutate(feature = factor(feature, levels = rev(feature)))
-  if (nrow(plot_df)) {
-    p <- ggplot(plot_df, aes(x = median_importance, y = feature, fill = source)) +
-      geom_col(width = 0.7) +
-      labs(
-        title = sprintf("Top features among successful %s models", model_type),
-        subtitle = sprintf("%s | %s | %s", config, criterion_label, out_stub),
-        x = "Median mean absolute approximate SHAP value",
-        y = NULL,
-        fill = "Source"
-      ) +
-      theme_minimal(base_size = 10) +
-      theme(plot.title = element_text(face = "bold"))
-    ggsave(
-      file.path(OUT_DIR, sprintf("top_features_%s.png", out_stub)),
-      p, width = 10, height = 8, dpi = 220, bg = "white"
-    )
-  }
   invisible(winners)
 }
 
@@ -5040,13 +5006,13 @@ if (file.exists(winners_path)) {
   table4$Criterion <- ifelse(table4$Model == "Continuous", "R² > 0", "AUC > 0.5")
   table4$`Eligible N` <- mapply(status_value, table4$Model, table4$config_id, MoreArgs = list(value_col = "eligible_participants"))
   table4$`SHAP N` <- mapply(status_value, table4$Model, table4$config_id, MoreArgs = list(value_col = "importance_participants"))
-  table4$`Top single feature` <- mapply(feature_value, table4$Model, table4$config_id, "feature")
+  table4$`Top individual predictor` <- mapply(feature_value, table4$Model, table4$config_id, "feature")
   table4$`Feature median mean absolute approximate SHAP` <- mapply(feature_value, table4$Model, table4$config_id, "feature", MoreArgs = list(value_col = "median_importance"))
-  table4$`Dominant source` <- mapply(feature_value, table4$Model, table4$config_id, "source")
-  table4$`Leading EMA item` <- mapply(feature_value, table4$Model, table4$config_id, "ema_item")
-  table4$`Leading passive sensor` <- mapply(feature_value, table4$Model, table4$config_id, "sensor")
-  table4$`Leading window` <- mapply(feature_value, table4$Model, table4$config_id, "window")
-  table4$`Leading index` <- mapply(feature_value, table4$Model, table4$config_id, "index")
+  table4$`Top grouped source` <- mapply(feature_value, table4$Model, table4$config_id, "source")
+  table4$`Top grouped EMA item` <- mapply(feature_value, table4$Model, table4$config_id, "ema_item")
+  table4$`Top grouped passive sensor` <- mapply(feature_value, table4$Model, table4$config_id, "sensor")
+  table4$`Top grouped time window` <- mapply(feature_value, table4$Model, table4$config_id, "window")
+  table4$`Top grouped index` <- mapply(feature_value, table4$Model, table4$config_id, "index")
   table4$config_id <- NULL
   write.csv(table4, table4_path, row.names = FALSE)
 } else if (file.exists(table4_path)) {
@@ -5069,7 +5035,7 @@ cat("\n===== OPTIONAL SECTION: ALL-PT TIME-SERIES FIGURES =====\n")
 
 if (RUN_ALL_PT_CONTINUOUS_TIMESERIES) {
   out_dir <- report_all_pt_continuous_dir
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
 
   cat("\nCreating PT0300 continuous time-series figure...\n")
   make_continuous_timeseries_for_participant(
@@ -5093,7 +5059,7 @@ if (RUN_ALL_PT_CONTINUOUS_TIMESERIES) {
 
 if (RUN_ALL_PT_HURDLE_TIMESERIES) {
   out_dir <- report_all_pt_hurdle_dir
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  make_dirs(out_dir)
 
   cat("\nCreating PT0300 hurdle time-series figure...\n")
   make_hurdle_timeseries_for_participant(
@@ -5141,7 +5107,7 @@ if (exists("FEATURE_IMPORTANCE_WORK_DIR", inherits = FALSE)) {
 }
 OUT_FILE <- file.path(REPORT_DIR, "feature_importance_all_in_one_aggregate.csv")
 
-dir.create(REPORT_DIR, showWarnings = FALSE, recursive = TRUE)
+make_dirs(REPORT_DIR)
 
 read_if_exists <- function(path) {
   if (!file.exists(path)) return(NULL)
@@ -5339,17 +5305,13 @@ cat("\n===== OPTIONAL SECTION: OUTCOME BASE-RATE / ZERO-INFLATION ANALYSIS =====
 #   raw_outcome.csv             one row per participant-day or EMA occasion
 #   perperson_performance.csv   one row per participant x feature configuration
 #
-# Outputs:
-#   perperson_baserate.csv
-#   baserate_predictability_results.csv
-#   Figure_base_rate_histogram.png
-#   Figure_base_rate_vs_predictability.png
+# Output:
+#   base_rate_analysis.csv
 ################################################################################
 
 suppressPackageStartupMessages({
   library(dplyr)
   library(tidyr)
-  library(ggplot2)
   library(stringr)
 })
 
@@ -5360,18 +5322,16 @@ cat(sprintf("Searching project roots:\n%s\n", paste(PROJECT_ROOTS, collapse = "\
 CLEAN_DATA_DIR <- file.path(BASE_PATH, "3. Cleaned data")
 RESULTS_ROOT_DIR <- file.path(BASE_PATH, "4. Results")
 REPORT_DIR <- file.path(RESULTS_ROOT_DIR, "report")
-dir.create(REPORT_DIR, showWarnings = FALSE, recursive = TRUE)
+make_dirs(REPORT_DIR)
 
 # ---- User-tunable inputs and thresholds ---------------------------------------
 DEFAULT_RAW_OUTCOME_FILE <- file.path(
-  path.expand("~"),
-  "Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction",
+  BASE_PATH,
   "3. Cleaned data",
   "all_features_included_filtered.csv"
 )
 DEFAULT_PERFORMANCE_FILE <- file.path(
-  path.expand("~"),
-  "Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction",
+  BASE_PATH,
   "4. Results",
   "report",
   "All_models_results_main.csv"
@@ -5545,6 +5505,7 @@ perperson_baserate <- daily_outcome %>%
   summarise(
     n_days = n(),
     n_ideation_days = sum(daily_occurrence == 1, na.rm = TRUE),
+    n_non_si_days = sum(daily_occurrence == 0, na.rm = TRUE),
     base_rate = n_ideation_days / n_days,
     sd_item9 = stats::sd(daily_intensity, na.rm = TRUE),
     .groups = "drop"
@@ -5553,13 +5514,11 @@ perperson_baserate <- daily_outcome %>%
     sd_item9 = ifelse(is.na(sd_item9), 0, sd_item9),
     near_invariant = sd_item9 == 0 | n_ideation_days <= NEAR_INVARIANT_MAX_IDEATION_DAYS,
     fail_low_si_positive = n_ideation_days < MIN_SI_POSITIVE_FOR_MODEL,
-    fail_low_non_si = (n_days - n_ideation_days) < MIN_NON_SI_FOR_MODEL,
+    fail_low_non_si = n_non_si_days < MIN_NON_SI_FOR_MODEL,
+    pass_si = !fail_low_si_positive & !fail_low_non_si,
     base_rate_below_5pct = base_rate < LOW_BASE_RATE_1,
     base_rate_below_10pct = base_rate < LOW_BASE_RATE_2
   )
-
-baserate_path <- file.path(REPORT_DIR, "perperson_baserate.csv")
-write.csv(perperson_baserate, baserate_path, row.names = FALSE)
 
 q_base <- stats::quantile(perperson_baserate$base_rate, probs = c(.25, .50, .75), na.rm = TRUE)
 base_min <- min(perperson_baserate$base_rate, na.rm = TRUE)
@@ -5583,21 +5542,6 @@ keystone_baserate_summary <- data.frame(
   excluded_due_to_both_low_si_and_low_non_si = n_low_both,
   stringsAsFactors = FALSE
 )
-keystone_baserate_path <- file.path(REPORT_DIR, "keystone_baserate_si_positive_exclusion_summary.csv")
-write.csv(keystone_baserate_summary, keystone_baserate_path, row.names = FALSE)
-keystone_si_count_path <- file.path(REPORT_DIR, "keystone_si_count_exclusion_summary.csv")
-write.csv(keystone_baserate_summary, keystone_si_count_path, row.names = FALSE)
-
-base_rate_inclusion_report <- perperson_baserate[, c(
-  "participant_id", "n_days", "n_ideation_days", "base_rate", "n_non_si_days",
-  "sd_item9", "near_invariant", "fail_low_si_positive", "fail_low_non_si"
-)]
-base_rate_inclusion_report$pass_si <- !base_rate_inclusion_report$fail_low_si_positive &
-  !base_rate_inclusion_report$fail_low_non_si
-names(base_rate_inclusion_report)[names(base_rate_inclusion_report) == "n_ideation_days"] <- "n_si_pos"
-names(base_rate_inclusion_report)[names(base_rate_inclusion_report) == "n_non_si_days"] <- "n_si_neg"
-inclusion_report_path <- file.path(REPORT_DIR, "inclusion_participant_report.csv")
-write.csv(base_rate_inclusion_report, inclusion_report_path, row.names = FALSE)
 
 cat("\nOutcome base-rate summary:\n")
 cat(sprintf("  Participants: %d\n", nrow(perperson_baserate)))
@@ -5610,29 +5554,6 @@ cat(sprintf("  Participants with zero ideation days: %d\n", n_zero_ideation))
 cat(sprintf("  KEYSTONE: participants with fewer than %d SI-positive days/observations: %d / %d\n",
             MIN_SI_POSITIVE_FOR_MODEL, n_low_si_positive, nrow(perperson_baserate)))
 cat(sprintf("  KEYSTONE only low SI-positive, not low non-SI: %d\n", n_low_si_positive_only))
-cat(sprintf("Saved keystone base-rate SI-positive exclusion summary: %s\n", keystone_baserate_path))
-cat(sprintf("Saved keystone SI-count summary alias: %s\n", keystone_si_count_path))
-cat(sprintf("Saved base-rate participant inclusion report: %s\n", inclusion_report_path))
-cat(sprintf("READ THIS KEYSTONE FILE: %s\n", keystone_si_count_path))
-cat(sprintf("Saved per-person base-rate file: %s\n", baserate_path))
-
-p_hist <- ggplot(perperson_baserate, aes(x = base_rate)) +
-  geom_histogram(binwidth = 0.025, boundary = 0, fill = "#7fb5a3", color = "white") +
-  geom_vline(xintercept = LOW_BASE_RATE_1, linetype = "dashed", color = "grey35") +
-  geom_vline(xintercept = LOW_BASE_RATE_2, linetype = "dashed", color = "grey35") +
-  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
-  labs(
-    title = "Daily item 9 base-rate distribution",
-    subtitle = sprintf("Near-invariant: %.1f%% | base rate < %.0f%%: %.1f%% | < %.0f%%: %.1f%%",
-                       pct_near_invariant, LOW_BASE_RATE_1 * 100, pct_below_5,
-                       LOW_BASE_RATE_2 * 100, pct_below_10),
-    x = "Participant-level daily ideation base rate",
-    y = "Participants"
-  ) +
-  theme_minimal(base_size = 11) +
-  theme(plot.title = element_text(face = "bold"))
-hist_path <- file.path(REPORT_DIR, "Figure_base_rate_histogram.png")
-ggsave(hist_path, p_hist, width = 8, height = 5, dpi = 220, bg = "white")
 
 metric_candidates <- c("corr", "cor", "r", "r2", "auc", "balanced_accuracy", "balanced_acc")
 metric_cols <- intersect(metric_candidates, names(performance))
@@ -5719,9 +5640,6 @@ assoc_results <- bind_rows(lapply(split(analysis_long, list(analysis_long$config
   ) %>%
   arrange(config, metric, predictor)
 
-results_path <- file.path(REPORT_DIR, "baserate_predictability_results.csv")
-write.csv(assoc_results, results_path, row.names = FALSE)
-
 median_perf <- analysis_long %>%
   group_by(config, metric) %>%
   summarise(
@@ -5736,39 +5654,10 @@ median_perf <- analysis_long %>%
     .groups = "drop"
   )
 
-cat("\nBase-rate predictability tests saved:\n")
-cat(sprintf("  %s\n", results_path))
 cat(sprintf("  Zero-ideation participants with undefined corr in performance file: %d\n",
             zero_ideation_with_corr_missing))
 cat("\nSensitivity check: median performance after dropping near-invariant / base_rate >= 10%:\n")
 print(median_perf, n = Inf)
-
-plot_df <- analysis_long %>%
-  filter(metric %in% c("corr", "r2", "auc", "balanced_accuracy")) %>%
-  mutate(
-    metric = factor(metric, levels = c("corr", "r2", "auc", "balanced_accuracy"),
-                    labels = c("Correlation", "R²", "AUC", "Balanced accuracy"))
-  )
-
-p_scatter <- ggplot(plot_df, aes(x = base_rate, y = metric_value)) +
-  geom_point(alpha = 0.55, size = 1.4, color = "#2f5f73") +
-  geom_smooth(method = "lm", se = TRUE, color = "#c85143", linewidth = 0.7) +
-  facet_grid(metric ~ config, scales = "free_y") +
-  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
-  labs(
-    title = "Does within-person predictability scale with item 9 base rate?",
-    subtitle = "Each point is one participant within a feature configuration; line is OLS fit for visualization.",
-    x = "Daily ideation base rate",
-    y = "Predictive performance"
-  ) +
-  theme_minimal(base_size = 9) +
-  theme(
-    plot.title = element_text(face = "bold"),
-    axis.text.x = element_text(angle = 30, hjust = 1),
-    panel.grid.minor = element_blank()
-  )
-scatter_path <- file.path(REPORT_DIR, "Figure_base_rate_vs_predictability.png")
-ggsave(scatter_path, p_scatter, width = 14, height = 9, dpi = 220, bg = "white")
 
 cat("\nHeadline numbers for abstract/results:\n")
 cat(sprintf("  Median base rate = %.1f%% [IQR %.1f%%, %.1f%%]\n",
@@ -5776,7 +5665,117 @@ cat(sprintf("  Median base rate = %.1f%% [IQR %.1f%%, %.1f%%]\n",
 cat(sprintf("  Near-invariant = %.1f%%; base rate < %.0f%% = %.1f%%; base rate < %.0f%% = %.1f%%\n",
             pct_near_invariant, LOW_BASE_RATE_1 * 100, pct_below_5,
             LOW_BASE_RATE_2 * 100, pct_below_10))
-cat(sprintf("  Figures saved: %s; %s\n", hist_path, scatter_path))
+
+base_rate_output_path <- file.path(REPORT_DIR, "base_rate_analysis.csv")
+
+empty_base_rate_row <- function(n = 0L) {
+  data.frame(
+    section = rep(NA_character_, n),
+    participant_id = rep(NA_character_, n),
+    config = rep(NA_character_, n),
+    metric = rep(NA_character_, n),
+    predictor = rep(NA_character_, n),
+    value = rep(NA_real_, n),
+    p = rep(NA_real_, n),
+    n = rep(NA_real_, n),
+    n_days = rep(NA_real_, n),
+    n_si_pos = rep(NA_real_, n),
+    n_non_si = rep(NA_real_, n),
+    base_rate = rep(NA_real_, n),
+    sd_item9 = rep(NA_real_, n),
+    near_invariant = rep(NA, n),
+    fail_low_si_positive = rep(NA, n),
+    fail_low_non_si = rep(NA, n),
+    pass_si = rep(NA, n),
+    spearman_rho = rep(NA_real_, n),
+    ols_beta = rep(NA_real_, n),
+    ols_p = rep(NA_real_, n),
+    median_all = rep(NA_real_, n),
+    median_not_near_invariant = rep(NA_real_, n),
+    median_base_rate_ge_10pct = rep(NA_real_, n),
+    note = rep(NA_character_, n),
+    stringsAsFactors = FALSE
+  )
+}
+
+participant_rows <- empty_base_rate_row(nrow(perperson_baserate))
+participant_rows$section <- "participant_base_rate"
+participant_rows$participant_id <- perperson_baserate$participant_id
+participant_rows$value <- perperson_baserate$base_rate
+participant_rows$n <- perperson_baserate$n_days
+participant_rows$n_days <- perperson_baserate$n_days
+participant_rows$n_si_pos <- perperson_baserate$n_ideation_days
+participant_rows$n_non_si <- perperson_baserate$n_non_si_days
+participant_rows$base_rate <- perperson_baserate$base_rate
+participant_rows$sd_item9 <- perperson_baserate$sd_item9
+participant_rows$near_invariant <- perperson_baserate$near_invariant
+participant_rows$fail_low_si_positive <- perperson_baserate$fail_low_si_positive
+participant_rows$fail_low_non_si <- perperson_baserate$fail_low_non_si
+participant_rows$pass_si <- perperson_baserate$pass_si
+
+summary_metrics <- c(
+  participants = nrow(perperson_baserate),
+  median_base_rate = unname(q_base[[2]]),
+  base_rate_iqr_25 = unname(q_base[[1]]),
+  base_rate_iqr_75 = unname(q_base[[3]]),
+  min_base_rate = base_min,
+  max_base_rate = base_max,
+  pct_near_invariant = pct_near_invariant,
+  pct_base_rate_below_5 = pct_below_5,
+  pct_base_rate_below_10 = pct_below_10,
+  zero_ideation_participants = n_zero_ideation,
+  zero_ideation_with_corr_missing = zero_ideation_with_corr_missing
+)
+summary_rows <- empty_base_rate_row(length(summary_metrics))
+summary_rows$section <- "overall_summary"
+summary_rows$metric <- names(summary_metrics)
+summary_rows$value <- as.numeric(summary_metrics)
+
+exclusion_metrics <- unlist(keystone_baserate_summary[1, ], use.names = TRUE)
+exclusion_rows <- empty_base_rate_row(length(exclusion_metrics))
+exclusion_rows$section <- "si_count_exclusion_summary"
+exclusion_rows$metric <- names(exclusion_metrics)
+exclusion_rows$value <- suppressWarnings(as.numeric(exclusion_metrics))
+exclusion_rows$note <- as.character(exclusion_metrics)
+
+association_rows <- empty_base_rate_row(nrow(assoc_results))
+association_rows$section <- "predictability_association"
+association_rows$config <- assoc_results$config
+association_rows$metric <- assoc_results$metric
+association_rows$predictor <- assoc_results$predictor
+association_rows$value <- assoc_results$spearman_rho
+association_rows$p <- assoc_results$p
+association_rows$n <- assoc_results$n
+association_rows$spearman_rho <- assoc_results$spearman_rho
+association_rows$ols_beta <- assoc_results$ols_beta
+association_rows$ols_p <- assoc_results$ols_p
+
+sensitivity_rows <- empty_base_rate_row(nrow(median_perf))
+sensitivity_rows$section <- "sensitivity_medians"
+sensitivity_rows$config <- median_perf$config
+sensitivity_rows$metric <- median_perf$metric
+sensitivity_rows$n <- median_perf$n_all
+sensitivity_rows$value <- median_perf$median_all
+sensitivity_rows$median_all <- median_perf$median_all
+sensitivity_rows$median_not_near_invariant <- median_perf$median_not_near_invariant
+sensitivity_rows$median_base_rate_ge_10pct <- median_perf$median_base_rate_ge_10pct
+sensitivity_rows$note <- sprintf(
+  "n_not_near_invariant=%s; n_base_rate_ge_10pct=%s; rises_after_dropping_near_invariant=%s; rises_after_base_rate_ge_10pct=%s",
+  median_perf$n_not_near_invariant,
+  median_perf$n_base_rate_ge_10pct,
+  median_perf$rises_after_dropping_near_invariant,
+  median_perf$rises_after_base_rate_ge_10pct
+)
+
+base_rate_analysis <- dplyr::bind_rows(
+  participant_rows,
+  summary_rows,
+  exclusion_rows,
+  association_rows,
+  sensitivity_rows
+)
+write.csv(base_rate_analysis, base_rate_output_path, row.names = FALSE)
+cat(sprintf("Saved consolidated base-rate analysis CSV: %s\n", base_rate_output_path))
 }
 
 cat("\nSingle-file workflow complete.\n")
