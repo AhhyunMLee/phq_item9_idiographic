@@ -1,7 +1,0 @@
-BASE_PATH <- "/Users/ahhyun/Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction"
-
-read.csv(file.path(
-  BASE_PATH,
-  "4. Results/report/keystone_si_count_exclusion_summary.csv"
-))
-

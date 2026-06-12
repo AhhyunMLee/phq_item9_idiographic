@@ -1,0 +1,10 @@
+.DS_Store
+
+# R session and workspace files
+.Rhistory
+.RData
+.RDataTmp*
+
+# RStudio project metadata
+.Rproj.user/
+.Rproj.user_backup_*/
