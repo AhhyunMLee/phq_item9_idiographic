@@ -2522,7 +2522,13 @@ ok_row <- function(uid, n_folds, n_obs,
 binary_metrics <- function(true_bin, p_si, threshold = 0.5) {
   ok <- !is.na(true_bin) & !is.na(p_si)
   true_bin <- as.integer(true_bin[ok])
-  pred_bin <- as.integer(p_si[ok] >= threshold)
+  p_si <- p_si[ok]
+  threshold <- if (length(threshold) == 1L) {
+    rep(threshold, length(p_si))
+  } else {
+    threshold[ok]
+  }
+  pred_bin <- as.integer(p_si >= threshold)
   if (!length(true_bin) || length(unique(true_bin)) < 2) {
     return(list(sensitivity=NA_real_, specificity=NA_real_, balanced_acc=NA_real_))
   }
@@ -2533,6 +2539,19 @@ binary_metrics <- function(true_bin, p_si, threshold = 0.5) {
   sens <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
   spec <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
   list(sensitivity=sens, specificity=spec, balanced_acc=mean(c(sens, spec), na.rm=TRUE))
+}
+choose_balanced_accuracy_threshold <- function(true_bin, p_si,
+                                               thresholds = seq(0.01, 0.99, by = 0.01)) {
+  ok <- !is.na(true_bin) & !is.na(p_si)
+  true_bin <- as.integer(true_bin[ok])
+  p_si <- p_si[ok]
+  if (!length(true_bin) || length(unique(true_bin)) < 2) return(0.5)
+  scores <- vapply(thresholds, function(thr) {
+    binary_metrics(true_bin, p_si, threshold = thr)$balanced_acc
+  }, numeric(1))
+  if (all(is.na(scores))) return(0.5)
+  best_thresholds <- thresholds[scores == max(scores, na.rm = TRUE)]
+  stats::median(best_thresholds, na.rm = TRUE)
 }
 ensure_result_metric_cols <- function(d) {
   if ("Participant" %in% names(d)) {
@@ -2665,8 +2684,12 @@ fit_hurdle <- function(pt, fb, cv_fn) {
       if (length(unique(tr_full$.bin)) < 2) next
       ff <- setdiff(names(tr_full), c(outcome, ".bin"))
       h <- hurdle_one_fit(tr_full, xvl, ff); if (is.null(h)) next
+      threshold <- choose_balanced_accuracy_threshold(
+        true_bin = as.integer(vl[[outcome]] > 0),
+        p_si = h$p_si
+      )
       s <- mean(abs(h$pred - vl[[outcome]]), na.rm=TRUE)
-      if (!is.na(s) && s < best$score) best <- list(score=s, w=w, pv=pv)
+      if (!is.na(s) && s < best$score) best <- list(score=s, w=w, pv=pv, threshold=threshold)
     }
     if (best$score==Inf) next
     pp2 <- tryCatch(preProcess(tv[,best$pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
@@ -2680,7 +2703,8 @@ fit_hurdle <- function(pt, fb, cv_fn) {
     ff <- setdiff(names(tv_full), c(outcome, ".bin"))
     h <- hurdle_one_fit(tv_full, x_te, ff); if (is.null(h)) next
     preds[[i]] <- data.frame(true=te[[outcome]], pred=h$pred,
-                             p_si=h$p_si, true_bin=as.integer(te[[outcome]]>0))
+                             p_si=h$p_si, true_bin=as.integer(te[[outcome]]>0),
+                             threshold=best$threshold)
   }
   if (length(preds)==0) return(empty_row(pt$uid[1], "no_successful_folds"))
   pdf_out <- bind_rows(preds)
@@ -2689,7 +2713,7 @@ fit_hurdle <- function(pt, fb, cv_fn) {
     else as.numeric(pROC::auc(pROC::roc(pdf_out$true_bin, pdf_out$p_si, quiet=TRUE)))
   }, error=function(e) NA_real_)
   met <- reg_metrics(pdf_out$pred, pdf_out$true)
-  bin <- binary_metrics(pdf_out$true_bin, pdf_out$p_si, threshold = 0.5)
+  bin <- binary_metrics(pdf_out$true_bin, pdf_out$p_si, threshold = pdf_out$threshold)
   ok_row(pt$uid[1], length(preds), nrow(pdf_out),
          cor_v=met$cor, r2_v=met$r2, mse_v=met$mse, mae_v=met$mae, rmse_v=met$rmse,
          auc_v=auc_v, sensitivity_v=bin$sensitivity, specificity_v=bin$specificity,
@@ -2702,12 +2726,18 @@ fit_hurdle_baseline <- function(pt, cv_fn) {
   sl <- cv_fn(pt); if (is.null(sl)) return(empty_row(pt$uid[1], "no_slices"))
   preds <- lapply(seq_along(sl$trains), function(i) {
     tr_y <- pt[[outcome]][sl$trains[[i]]]
+    vl_y <- pt[[outcome]][sl$vals[[i]]]
     p_si <- mean(tr_y > 0, na.rm=TRUE)
     sev  <- mean(tr_y[tr_y > 0], na.rm=TRUE); if (is.na(sev)) sev <- 0
     final <- max(0, min(1, p_si * sev))
     te_y <- pt[[outcome]][sl$tests[[i]]]
+    threshold <- choose_balanced_accuracy_threshold(
+      true_bin = as.integer(vl_y > 0),
+      p_si = rep(p_si, length(vl_y))
+    )
     data.frame(true=te_y, pred=rep(final, length(te_y)),
-               p_si=rep(p_si, length(te_y)), true_bin=as.integer(te_y>0))
+               p_si=rep(p_si, length(te_y)), true_bin=as.integer(te_y>0),
+               threshold=threshold)
   })
   preds <- Filter(Negate(is.null), preds)
   if (length(preds)==0) return(empty_row(pt$uid[1], "no_successful_folds"))
@@ -2717,7 +2747,7 @@ fit_hurdle_baseline <- function(pt, cv_fn) {
     else as.numeric(pROC::auc(pROC::roc(pdf_out$true_bin, pdf_out$p_si, quiet=TRUE)))
   }, error=function(e) NA_real_)
   met <- reg_metrics(pdf_out$pred, pdf_out$true)
-  bin <- binary_metrics(pdf_out$true_bin, pdf_out$p_si, threshold = 0.5)
+  bin <- binary_metrics(pdf_out$true_bin, pdf_out$p_si, threshold = pdf_out$threshold)
   ok_row(pt$uid[1], length(preds), nrow(pdf_out),
          cor_v=met$cor, r2_v=met$r2, mse_v=met$mse, mae_v=met$mae, rmse_v=met$rmse,
          auc_v=auc_v, sensitivity_v=bin$sensitivity, specificity_v=bin$specificity,
@@ -2737,7 +2767,7 @@ run_one <- function(model_type, config_name, fb=NULL, cv_fn) {
                            "GBM_CLS","GBM_REG","apply_minmax_fold",
                            "candidate_predictors",
                            "drop_near_zero_variance_features","is_passive_feature",
-                           "reg_metrics","binary_metrics",
+                           "reg_metrics","binary_metrics","choose_balanced_accuracy_threshold",
                            "fit_continuous","fit_continuous_baseline",
                            "fit_hurdle","fit_hurdle_baseline","hurdle_one_fit",
                            "empty_row","ok_row",
@@ -3106,7 +3136,7 @@ make_predictive_performance_tables <- function(combined, baseline_tests = NULL,
       `% AUC>0.5` = pct_gt(d$auc, 0.5),
       `Sensitivity, median [IQR]` = fmt_iqr(d$sensitivity, 2),
       `Specificity, median [IQR]` = fmt_iqr(d$specificity, 2),
-      `Balanced acc., median [IQR]` = fmt_iqr(d$balanced_acc, 2),
+      `Balanced acc. (validation threshold), median [IQR]` = fmt_iqr(d$balanced_acc, 2),
       `MAE, median [IQR]` = fmt_iqr(d$mae, 4),
       check.names = FALSE
     )
@@ -3117,7 +3147,7 @@ make_predictive_performance_tables <- function(combined, baseline_tests = NULL,
   hurdle_table <- hurdle_raw %>%
     select(`Model type`, Configuration, n, `AUC, median [IQR]`, `% AUC>0.5`,
            `Sensitivity, median [IQR]`, `Specificity, median [IQR]`,
-           `Balanced acc., median [IQR]`, `MAE, median [IQR]`)
+           `Balanced acc. (validation threshold), median [IQR]`, `MAE, median [IQR]`)
   perf_table <- bind_rows(cont_table, hurdle_table)
 
   cont_report_table <- cont_table %>% select(-`Model type`)
@@ -3434,7 +3464,7 @@ suppressPackageStartupMessages({
 #    Refits ONLY the best hurdle config per participant to recover the per-fold
 #    held-out predictions and SI probabilities.
 # ==============================================================================
-hurdle_pt_clsmetrics <- function(pt, fb, cv_fn, thr = 0.5) {
+hurdle_pt_clsmetrics <- function(pt, fb, cv_fn) {
   feats <- candidate_predictors(pt)
   if (length(feats) < 1 || var(pt[[outcome]], na.rm = TRUE) %in% c(0, NA)) return(NULL)
   n_si_pos <- sum(pt[[outcome]] > 0, na.rm = TRUE)
@@ -3463,8 +3493,12 @@ hurdle_pt_clsmetrics <- function(pt, fb, cv_fn, thr = 0.5) {
       if (length(unique(trf$.bin)) < 2) next
       ff <- setdiff(names(trf), c(outcome, ".bin"))
       h <- hurdle_one_fit(trf, xvl, ff); if (is.null(h)) next
+      threshold <- choose_balanced_accuracy_threshold(
+        true_bin = as.integer(vl[[outcome]] > 0),
+        p_si = h$p_si
+      )
       s <- mean(abs(h$pred - vl[[outcome]]), na.rm = TRUE)
-      if (!is.na(s) && s < best$score) best <- list(score=s, w=w, pv=pv)
+      if (!is.na(s) && s < best$score) best <- list(score=s, w=w, pv=pv, threshold=threshold)
     }
     if (best$score == Inf) next
     pp2 <- tryCatch(caret::preProcess(tv[,best$pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
@@ -3478,20 +3512,17 @@ hurdle_pt_clsmetrics <- function(pt, fb, cv_fn, thr = 0.5) {
     ff <- setdiff(names(tvf), c(outcome, ".bin"))
     h <- hurdle_one_fit(tvf, x_te, ff); if (is.null(h)) next
     preds[[i]] <- data.frame(true=te[[outcome]], pred=h$pred,
-                             p_si=h$p_si, true_bin=as.integer(te[[outcome]]>0))
+                             p_si=h$p_si, true_bin=as.integer(te[[outcome]]>0),
+                             threshold=best$threshold)
   }
   if (length(preds) == 0) return(NULL)
   pd <- do.call(rbind, preds)
   if (length(unique(pd$true_bin)) < 2) return(NULL)
-  pb <- as.integer(pd$p_si >= thr)
-  TP <- sum(pb==1 & pd$true_bin==1); FN <- sum(pb==0 & pd$true_bin==1)
-  TN <- sum(pb==0 & pd$true_bin==0); FP <- sum(pb==1 & pd$true_bin==0)
-  sens <- if ((TP+FN)>0) TP/(TP+FN) else NA_real_
-  spec <- if ((TN+FP)>0) TN/(TN+FP) else NA_real_
+  bin <- binary_metrics(pd$true_bin, pd$p_si, threshold = pd$threshold)
   auc  <- tryCatch(as.numeric(pROC::auc(pROC::roc(pd$true_bin, pd$p_si, quiet=TRUE))), error=function(e) NA_real_)
   met <- reg_metrics(pd$pred, pd$true)
-  data.frame(Participant=pt$uid[1], auc=auc, sensitivity=sens, specificity=spec,
-             balanced_acc=mean(c(sens,spec), na.rm=TRUE),
+  data.frame(Participant=pt$uid[1], auc=auc, sensitivity=bin$sensitivity, specificity=bin$specificity,
+             balanced_acc=bin$balanced_acc,
              cor=met$cor, r2=met$r2, mae=met$mae,
              n_obs=nrow(pd), n_SI=sum(pd$true_bin==1), n_nonSI=sum(pd$true_bin==0),
              mean_pred_SI=mean(pd$pred[pd$true_bin==1], na.rm=TRUE),
@@ -3934,9 +3965,9 @@ make_F2_hurdle <- function(combined, variant_name, cv_params = NULL) {
 
   pct_auc <- mean(best_df$auc > 0.5, na.rm = TRUE) * 100
   metric_map <- c(auc = "AUC", sensitivity = "Sensitivity",
-                  specificity = "Specificity", balanced_acc = "Balanced acc.")
+                  specificity = "Specificity", balanced_acc = "Balanced acc. (val. threshold)")
   metric_palette <- c("AUC" = "grey20", "Sensitivity" = "#7fb5a3",
-                      "Specificity" = "#e7b64b", "Balanced acc." = "#e66a7a")
+                      "Specificity" = "#e7b64b", "Balanced acc. (val. threshold)" = "#e66a7a")
   dot_df <- best_df %>% arrange(auc) %>%
     mutate(rank = row_number()) %>%
     select(rank, all_of(names(metric_map))) %>%
@@ -3983,7 +4014,7 @@ make_F2_hurdle <- function(combined, variant_name, cv_params = NULL) {
           axis.text.y = element_blank(), axis.ticks.y = element_blank(),
           panel.grid.major.y = element_blank())
 
-  density_order <- c("Specificity", "AUC", "Sensitivity", "Balanced acc.")
+  density_order <- c("Specificity", "AUC", "Sensitivity", "Balanced acc. (val. threshold)")
   density_panels <- lapply(density_order, function(mm) {
     dd <- dot_df %>% filter(metric == mm, is.finite(value))
     med <- median(dd$value, na.rm = TRUE)
@@ -4119,9 +4150,9 @@ make_F2_reference_style <- function(combined, variant_name = "main") {
     hurdle_df <- hurdle_df %>%
       filter(!is.na(sensitivity), !is.na(specificity), !is.na(balanced_acc))
     hurdle_metrics <- c(auc = "AUC", sensitivity = "Sensitivity",
-                        specificity = "Specificity", balanced_acc = "Balanced acc.")
+                        specificity = "Specificity", balanced_acc = "Balanced acc. (val. threshold)")
     hurdle_palette <- c("AUC" = "#252525", "Sensitivity" = "#7fb5a3",
-                        "Specificity" = "#e7b64b", "Balanced acc." = "#e66a7a")
+                        "Specificity" = "#e7b64b", "Balanced acc. (val. threshold)" = "#e66a7a")
   } else {
     hurdle_df <- hurdle_df %>% filter(!is.na(cor), !is.na(mae))
     hurdle_metrics <- c(auc = "AUC", cor = "Pearson r", mae = "MAE (norm)")
