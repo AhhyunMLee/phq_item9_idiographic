@@ -1929,18 +1929,18 @@ RESULTS_ROOT_DIR <- file.path(BASE_PATH, "4. Results")
 EMA_FILE   <- "3._TD_cohort_EMA_FINAL.csv"
 MODEL_FILE <- "all_features_included.csv"
 DEMO_FILE  <- "9._FinalDemographics.csv"
-N_CORES    <- 12
-NTREE      <- 700
-MIN_FOLDS  <- 10
-REBUILD_EMA_FEATURES <- FALSE
-REBUILD_MODEL_CACHE <- FALSE
-RERUN_MODEL_RESULTS <- FALSE
-RERUN_F2_HURDLE <- TRUE
-RERUN_F2_REFERENCE_STYLE <- FALSE
-RUN_CONTINUOUS_MODELS <- TRUE
-RUN_HURDLE_MODELS <- TRUE
-RERUN_COMPLETED_CONFIGS <- FALSE
-RUN_MODEL_DIAGNOSTICS <- FALSE
+N_CORES    <- set_default_flag("N_CORES", 12)
+NTREE      <- set_default_flag("NTREE", 700)
+MIN_FOLDS  <- set_default_flag("MIN_FOLDS", 10)
+REBUILD_EMA_FEATURES <- set_default_flag("REBUILD_EMA_FEATURES", FALSE)
+REBUILD_MODEL_CACHE <- set_default_flag("REBUILD_MODEL_CACHE", FALSE)
+RERUN_MODEL_RESULTS <- set_default_flag("RERUN_MODEL_RESULTS", FALSE)
+RERUN_F2_HURDLE <- set_default_flag("RERUN_F2_HURDLE", TRUE)
+RERUN_F2_REFERENCE_STYLE <- set_default_flag("RERUN_F2_REFERENCE_STYLE", FALSE)
+RUN_CONTINUOUS_MODELS <- set_default_flag("RUN_CONTINUOUS_MODELS", TRUE)
+RUN_HURDLE_MODELS <- set_default_flag("RUN_HURDLE_MODELS", TRUE)
+RERUN_COMPLETED_CONFIGS <- set_default_flag("RERUN_COMPLETED_CONFIGS", FALSE)
+RUN_MODEL_DIAGNOSTICS <- set_default_flag("RUN_MODEL_DIAGNOSTICS", FALSE)
 SENSOR_FOLDERS <- list(
   acc="acceleration", hr="hr", steps="steps", convo="convo", gps="raw_gps_clean",
   gps_home="raw_gps_clean", sms="sms", calls="calls", battery="battery",
@@ -2540,18 +2540,23 @@ binary_metrics <- function(true_bin, p_si, threshold = 0.5) {
   spec <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
   list(sensitivity=sens, specificity=spec, balanced_acc=mean(c(sens, spec), na.rm=TRUE))
 }
-choose_balanced_accuracy_threshold <- function(true_bin, p_si,
-                                               thresholds = seq(0.01, 0.99, by = 0.01)) {
+choose_youden_threshold <- function(true_bin, p_si,
+                                    thresholds = seq(0.01, 0.99, by = 0.01)) {
   ok <- !is.na(true_bin) & !is.na(p_si)
   true_bin <- as.integer(true_bin[ok])
   p_si <- p_si[ok]
   if (!length(true_bin) || length(unique(true_bin)) < 2) return(0.5)
   scores <- vapply(thresholds, function(thr) {
-    binary_metrics(true_bin, p_si, threshold = thr)$balanced_acc
+    bin <- binary_metrics(true_bin, p_si, threshold = thr)
+    bin$sensitivity + bin$specificity - 1
   }, numeric(1))
   if (all(is.na(scores))) return(0.5)
   best_thresholds <- thresholds[scores == max(scores, na.rm = TRUE)]
   stats::median(best_thresholds, na.rm = TRUE)
+}
+has_two_binary_classes <- function(x) {
+  x <- x[!is.na(x)]
+  length(unique(x)) >= 2
 }
 ensure_result_metric_cols <- function(d) {
   if ("Participant" %in% names(d)) {
@@ -2670,7 +2675,7 @@ fit_hurdle <- function(pt, fb, cv_fn) {
     tr <- apply_minmax_fold(tr_ref, tr, scale_cols)
     vl <- apply_minmax_fold(tr_ref, vl, scale_cols)
     te <- apply_minmax_fold(tr_ref, te, scale_cols)
-    tv <- rbind(tr, vl); best <- list(score=Inf)
+    tv <- rbind(tr, vl); best <- list(score=-Inf, mae=Inf)
     for (w in WINDOWS) {
       pv <- intersect(fb(w, data_model_base), feats); if (length(pv)<2) next
       pv <- drop_near_zero_variance_features(pv, tr, freqCut = 19, uniqueCut = 10); if (length(pv)<2) next
@@ -2684,14 +2689,33 @@ fit_hurdle <- function(pt, fb, cv_fn) {
       if (length(unique(tr_full$.bin)) < 2) next
       ff <- setdiff(names(tr_full), c(outcome, ".bin"))
       h <- hurdle_one_fit(tr_full, xvl, ff); if (is.null(h)) next
-      threshold <- choose_balanced_accuracy_threshold(
-        true_bin = as.integer(vl[[outcome]] > 0),
+      vl_bin <- as.integer(vl[[outcome]] > 0)
+      threshold <- choose_youden_threshold(
+        true_bin = vl_bin,
         p_si = h$p_si
       )
+      if (!has_two_binary_classes(vl_bin)) {
+        h_train <- hurdle_one_fit(tr_full, xtr, ff)
+        if (!is.null(h_train)) {
+          threshold <- choose_youden_threshold(
+            true_bin = as.integer(tr[[outcome]] > 0),
+            p_si = h_train$p_si
+          )
+        }
+      }
+      bin <- binary_metrics(
+        true_bin = vl_bin,
+        p_si = h$p_si,
+        threshold = threshold
+      )
       s <- mean(abs(h$pred - vl[[outcome]]), na.rm=TRUE)
-      if (!is.na(s) && s < best$score) best <- list(score=s, w=w, pv=pv, threshold=threshold)
+      if (!is.na(bin$balanced_acc) &&
+          (bin$balanced_acc > best$score ||
+           (bin$balanced_acc == best$score && !is.na(s) && s < best$mae))) {
+        best <- list(score=bin$balanced_acc, mae=s, w=w, pv=pv, threshold=threshold)
+      }
     }
-    if (best$score==Inf) next
+    if (best$score == -Inf) next
     pp2 <- tryCatch(preProcess(tv[,best$pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
     if (is.null(pp2)) next
     x_tv <- tryCatch(predict(pp2, tv[,best$pv,drop=FALSE]), error=function(e) NULL)
@@ -2731,7 +2755,7 @@ fit_hurdle_baseline <- function(pt, cv_fn) {
     sev  <- mean(tr_y[tr_y > 0], na.rm=TRUE); if (is.na(sev)) sev <- 0
     final <- max(0, min(1, p_si * sev))
     te_y <- pt[[outcome]][sl$tests[[i]]]
-    threshold <- choose_balanced_accuracy_threshold(
+    threshold <- choose_youden_threshold(
       true_bin = as.integer(vl_y > 0),
       p_si = rep(p_si, length(vl_y))
     )
@@ -2767,7 +2791,8 @@ run_one <- function(model_type, config_name, fb=NULL, cv_fn) {
                            "GBM_CLS","GBM_REG","apply_minmax_fold",
                            "candidate_predictors",
                            "drop_near_zero_variance_features","is_passive_feature",
-                           "reg_metrics","binary_metrics","choose_balanced_accuracy_threshold",
+                           "reg_metrics","binary_metrics","choose_youden_threshold",
+                           "has_two_binary_classes",
                            "fit_continuous","fit_continuous_baseline",
                            "fit_hurdle","fit_hurdle_baseline","hurdle_one_fit",
                            "empty_row","ok_row",
@@ -3136,7 +3161,7 @@ make_predictive_performance_tables <- function(combined, baseline_tests = NULL,
       `% AUC>0.5` = pct_gt(d$auc, 0.5),
       `Sensitivity, median [IQR]` = fmt_iqr(d$sensitivity, 2),
       `Specificity, median [IQR]` = fmt_iqr(d$specificity, 2),
-      `Balanced acc. (validation threshold), median [IQR]` = fmt_iqr(d$balanced_acc, 2),
+      `Balanced acc. (Youden threshold), median [IQR]` = fmt_iqr(d$balanced_acc, 2),
       `MAE, median [IQR]` = fmt_iqr(d$mae, 4),
       check.names = FALSE
     )
@@ -3147,7 +3172,7 @@ make_predictive_performance_tables <- function(combined, baseline_tests = NULL,
   hurdle_table <- hurdle_raw %>%
     select(`Model type`, Configuration, n, `AUC, median [IQR]`, `% AUC>0.5`,
            `Sensitivity, median [IQR]`, `Specificity, median [IQR]`,
-           `Balanced acc. (validation threshold), median [IQR]`, `MAE, median [IQR]`)
+           `Balanced acc. (Youden threshold), median [IQR]`, `MAE, median [IQR]`)
   perf_table <- bind_rows(cont_table, hurdle_table)
 
   cont_report_table <- cont_table %>% select(-`Model type`)
@@ -3479,7 +3504,7 @@ hurdle_pt_clsmetrics <- function(pt, fb, cv_fn) {
     tr <- apply_minmax_fold(tr_ref, tr, scale_cols)
     vl <- apply_minmax_fold(tr_ref, vl, scale_cols)
     te <- apply_minmax_fold(tr_ref, te, scale_cols)
-    tv <- rbind(tr, vl); best <- list(score = Inf)
+    tv <- rbind(tr, vl); best <- list(score = -Inf, mae = Inf)
     for (w in WINDOWS) {
       pv <- intersect(fb(w, data_model_base), feats); if (length(pv) < 2) next
       pv <- drop_near_zero_variance_features(pv, tr, freqCut = 19, uniqueCut = 10); if (length(pv) < 2) next
@@ -3493,14 +3518,33 @@ hurdle_pt_clsmetrics <- function(pt, fb, cv_fn) {
       if (length(unique(trf$.bin)) < 2) next
       ff <- setdiff(names(trf), c(outcome, ".bin"))
       h <- hurdle_one_fit(trf, xvl, ff); if (is.null(h)) next
-      threshold <- choose_balanced_accuracy_threshold(
-        true_bin = as.integer(vl[[outcome]] > 0),
+      vl_bin <- as.integer(vl[[outcome]] > 0)
+      threshold <- choose_youden_threshold(
+        true_bin = vl_bin,
         p_si = h$p_si
       )
+      if (!has_two_binary_classes(vl_bin)) {
+        h_train <- hurdle_one_fit(trf, xtr, ff)
+        if (!is.null(h_train)) {
+          threshold <- choose_youden_threshold(
+            true_bin = as.integer(tr[[outcome]] > 0),
+            p_si = h_train$p_si
+          )
+        }
+      }
+      bin <- binary_metrics(
+        true_bin = vl_bin,
+        p_si = h$p_si,
+        threshold = threshold
+      )
       s <- mean(abs(h$pred - vl[[outcome]]), na.rm = TRUE)
-      if (!is.na(s) && s < best$score) best <- list(score=s, w=w, pv=pv, threshold=threshold)
+      if (!is.na(bin$balanced_acc) &&
+          (bin$balanced_acc > best$score ||
+           (bin$balanced_acc == best$score && !is.na(s) && s < best$mae))) {
+        best <- list(score=bin$balanced_acc, mae=s, w=w, pv=pv, threshold=threshold)
+      }
     }
-    if (best$score == Inf) next
+    if (best$score == -Inf) next
     pp2 <- tryCatch(caret::preProcess(tv[,best$pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
     if (is.null(pp2)) next
     x_tv <- tryCatch(predict(pp2, tv[,best$pv,drop=FALSE]), error=function(e) NULL)
@@ -3965,9 +4009,9 @@ make_F2_hurdle <- function(combined, variant_name, cv_params = NULL) {
 
   pct_auc <- mean(best_df$auc > 0.5, na.rm = TRUE) * 100
   metric_map <- c(auc = "AUC", sensitivity = "Sensitivity",
-                  specificity = "Specificity", balanced_acc = "Balanced acc. (val. threshold)")
+                  specificity = "Specificity", balanced_acc = "Balanced acc. (Youden threshold)")
   metric_palette <- c("AUC" = "grey20", "Sensitivity" = "#7fb5a3",
-                      "Specificity" = "#e7b64b", "Balanced acc. (val. threshold)" = "#e66a7a")
+                      "Specificity" = "#e7b64b", "Balanced acc. (Youden threshold)" = "#e66a7a")
   dot_df <- best_df %>% arrange(auc) %>%
     mutate(rank = row_number()) %>%
     select(rank, all_of(names(metric_map))) %>%
@@ -4014,7 +4058,7 @@ make_F2_hurdle <- function(combined, variant_name, cv_params = NULL) {
           axis.text.y = element_blank(), axis.ticks.y = element_blank(),
           panel.grid.major.y = element_blank())
 
-  density_order <- c("Specificity", "AUC", "Sensitivity", "Balanced acc. (val. threshold)")
+  density_order <- c("Specificity", "AUC", "Sensitivity", "Balanced acc. (Youden threshold)")
   density_panels <- lapply(density_order, function(mm) {
     dd <- dot_df %>% filter(metric == mm, is.finite(value))
     med <- median(dd$value, na.rm = TRUE)
@@ -4150,9 +4194,9 @@ make_F2_reference_style <- function(combined, variant_name = "main") {
     hurdle_df <- hurdle_df %>%
       filter(!is.na(sensitivity), !is.na(specificity), !is.na(balanced_acc))
     hurdle_metrics <- c(auc = "AUC", sensitivity = "Sensitivity",
-                        specificity = "Specificity", balanced_acc = "Balanced acc. (val. threshold)")
+                        specificity = "Specificity", balanced_acc = "Balanced acc. (Youden threshold)")
     hurdle_palette <- c("AUC" = "#252525", "Sensitivity" = "#7fb5a3",
-                        "Specificity" = "#e7b64b", "Balanced acc. (val. threshold)" = "#e66a7a")
+                        "Specificity" = "#e7b64b", "Balanced acc. (Youden threshold)" = "#e66a7a")
   } else {
     hurdle_df <- hurdle_df %>% filter(!is.na(cor), !is.na(mae))
     hurdle_metrics <- c(auc = "AUC", cor = "Pearson r", mae = "MAE (norm)")
