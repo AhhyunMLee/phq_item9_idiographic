@@ -1,3209 +1,991 @@
 ################################################################################
-# SI Idiographic Prediction Project - Final Single R Script
+# SI Idiographic Prediction Project - Data Analysis Script
 #
-# Folder layout expected under BASE_PATH:
-#   1. Code
-#   2. Raw data
-#   3. Cleaned data
-#   4. Results
+#   Baseline                  (predict the training mean)
+#   EMA                       (EMA mean features)
+#   EMA (dynamic)             (EMA mean + MAD features)
+#   Passive                   (all passive sensors pooled, mean features)
+#   Passive (dynamic)         (all passive sensors pooled, mean + dynamic)
+#   EMA + Passive             (EMA mean + pooled passive mean)
+#   EMA + Passive (dynamic)   (all of the above)
 #
-# To run from another R session, set flags before sourcing this file, for example:
-#   Sys.setenv(SI_PROJECT_BASE = "/path/to/SI_Prediction")
-#   RUN_MAIN_PIPELINE <- TRUE
-#   source("si_idiographic_2026.R")
+# Feature-set selection is over TIME WINDOW only; sensors are pooled within a
+# window. Window, mtry and ntree are chosen on the validation split of each
+# fold, then refit on train+val and evaluated once on the held-out test day.
+#
+# Input : all_features_cleaned.csv   (already the analytic sample — participant
+#         inclusion criteria are applied in the data-cleaning script)
+# Output: Table_continuous_models_all.csv, Table_continuous_models_common.csv,
+#         model_comparison_participant_metrics.csv,
+#         model_comparison_predictions.csv
 ################################################################################
 
-set_default_flag <- function(name, value) {
-  if (exists(name, envir = .GlobalEnv, inherits = FALSE)) {
-    return(get(name, envir = .GlobalEnv, inherits = FALSE))
-  }
-  assign(name, value, envir = .GlobalEnv)
-  value
+library(dplyr)
+library(stringr)
+library(tibble)
+library(caret)
+library(randomForest)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(data.table)
+library(pROC)
+
+# ------------------------------------------------------------------------------
+# 1. LOAD DATA
+# ------------------------------------------------------------------------------
+setwd("/Users/ahhyun/Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction/3. Cleaned data")
+
+OUTCOME <- "q9"
+N_CORES <- 10
+
+# fread keeps uid as character so "0011" does not become 11
+dat <- data.table::fread("all_features_cleaned.csv",
+                         colClasses = list(character = "uid")) %>%
+  as.data.frame()
+
+# Sliding-window CV slices by ROW POSITION, so rows must be in chronological
+# order within each participant, and prompts without an outcome are dropped.
+dat <- dat %>%
+  mutate(.ord = match(ema_time, c("morning", "afternoon", "evening"))) %>%
+  arrange(uid, date_rep, .ord) %>%
+  select(-.ord) %>%
+  filter(!is.na(.data[[OUTCOME]]))
+
+cat(sprintf("Loaded %d rows | %d participants\n", nrow(dat), n_distinct(dat$uid)))
+
+# ------------------------------------------------------------------------------
+# 2. CLASSIFY FEATURE COLUMNS
+# ------------------------------------------------------------------------------
+non_feature <- c("uid","date_rep","ema_time","mlife_id","compliance","ema_timestamp",
+                 "ema_day","q9","q1","q2","q3","q4","q5","q6","q7","q8","g1","g2")
+
+all_cols <- setdiff(colnames(dat), non_feature)
+all_cols <- all_cols[!grepl("(_coverage|_n_obs)$", all_cols)]
+
+EMA_WINDOWED_PATTERN   <- "^(q[1-9]|g[12])_(mean|mad)_d(1|7)$"
+SLEEP_PATTERN          <- "^sleep_(mean|mad)_(total_sleep|rem_sleep)_(day1|day7)$"
+PASSIVE_WINDOW_PATTERN <- "(hr1|hr4|day1|day7)"
+
+col_class <- tibble(col = all_cols) %>%
+  mutate(
+    is_ema_windowed = str_detect(col, regex(EMA_WINDOWED_PATTERN, ignore_case = TRUE)),
+    is_sleep        = str_detect(col, regex(SLEEP_PATTERN, ignore_case = TRUE)),
+    is_passive      = str_detect(col, regex(PASSIVE_WINDOW_PATTERN, ignore_case = TRUE)) &
+      !is_ema_windowed & !is_sleep,
+    source = case_when(is_ema_windowed ~ "ema",
+                       is_sleep        ~ "passive",
+                       is_passive      ~ "passive",
+                       TRUE            ~ "unclassified"),
+    type = case_when(
+      is_ema_windowed & str_detect(col, "_mean_d[17]$") ~ "mean",
+      is_ema_windowed & str_detect(col, "_mad_d[17]$")  ~ "dynamic",
+      is_sleep   & str_detect(col, "^sleep_mean_") ~ "mean",
+      is_sleep   & str_detect(col, "^sleep_mad_")  ~ "dynamic",
+      is_passive & str_detect(col, regex("(_mean_val|_sum_val)$", ignore_case = TRUE)) ~ "mean",
+      is_passive & str_detect(col, regex("(_mad_val|_entropy|_p90p10)$", ignore_case = TRUE)) ~ "dynamic",
+      TRUE ~ NA_character_),
+    window = case_when(
+      is_ema_windowed ~ str_replace(str_extract(col, "d[17]$"), "^d", "day"),
+      is_sleep        ~ str_extract(col, "(day1|day7)$"),
+      is_passive      ~ str_extract(col, regex(PASSIVE_WINDOW_PATTERN, ignore_case = TRUE)),
+      TRUE ~ NA_character_),
+    sensor = case_when(
+      is_sleep   ~ paste0("sleep_", str_extract(col, "(total_sleep|rem_sleep)")),
+      is_passive ~ str_remove(col, regex(paste0("_(", PASSIVE_WINDOW_PATTERN, ")_.*$"),
+                                         ignore_case = TRUE)),
+      TRUE ~ NA_character_)
+  ) %>%
+  filter(source != "unclassified", !is.na(type), !is.na(window))
+
+sensors_standard <- col_class %>% filter(source == "passive") %>% pull(sensor) %>% unique()
+windows_standard <- col_class %>% filter(source == "passive") %>% pull(window) %>% unique()
+windows_ema      <- col_class %>% filter(source == "ema")     %>% pull(window) %>% unique()
+
+cat(sprintf("Features classified: EMA windows [%s] | %d passive sensors x %d windows\n",
+            paste(windows_ema, collapse = ", "),
+            length(sensors_standard), length(windows_standard)))
+
+# All passive sensors pooled within a window (sleep included).
+passive_cols_for <- function(window, include_dynamic) {
+  types <- if (include_dynamic) c("mean", "dynamic") else "mean"
+  col_class %>%
+    filter(source == "passive", window == !!window, type %in% types) %>%
+    pull(col)
 }
 
-require_packages_or_stop <- function(packages, context = "this analysis") {
-  missing <- packages[!(packages %in% rownames(installed.packages()))]
-  if (length(missing)) {
-    stop(
-      sprintf(
-        "Missing R packages required for %s: %s\nInstall them with:\ninstall.packages(c(%s))",
-        context,
-        paste(missing, collapse = ", "),
-        paste(sprintf('"%s"', missing), collapse = ", ")
-      ),
-      call. = FALSE
-    )
-  }
-  invisible(TRUE)
-}
-
-# Create directories quietly, including missing parent folders.
-make_dirs <- function(...) {
-  invisible(lapply(c(...), dir.create, showWarnings = FALSE, recursive = TRUE))
-}
-
-# Public run flags. Existing values set before source() are preserved.
-RUN_DATA_CLEANING <- set_default_flag("RUN_DATA_CLEANING", FALSE)
-RUN_MAIN_PIPELINE <- set_default_flag("RUN_MAIN_PIPELINE", FALSE)
-RUN_FINAL_MANUSCRIPT_OUTPUTS <- set_default_flag("RUN_FINAL_MANUSCRIPT_OUTPUTS", FALSE)
-RUN_FEATURE_IMPORTANCE <- set_default_flag("RUN_FEATURE_IMPORTANCE", FALSE)
-RUN_ALL_PT_CONTINUOUS_TIMESERIES <- set_default_flag("RUN_ALL_PT_CONTINUOUS_TIMESERIES", FALSE)
-RUN_ALL_PT_HURDLE_TIMESERIES <- set_default_flag("RUN_ALL_PT_HURDLE_TIMESERIES", FALSE)
-KEEP_FEATURE_IMPORTANCE_DETAILS <- set_default_flag("KEEP_FEATURE_IMPORTANCE_DETAILS", FALSE)
-RUN_EXTRA_DIAGNOSTIC_FIGURES <- set_default_flag("RUN_EXTRA_DIAGNOSTIC_FIGURES", FALSE)
-RUN_BASE_RATE_ANALYSIS <- set_default_flag("RUN_BASE_RATE_ANALYSIS", FALSE)
-
-PROJECT_DIR <- tryCatch(
-  dirname(normalizePath(sys.frame(1)$ofile)),
-  error = function(e) getwd()
-)
-setwd(PROJECT_DIR)
-cat("\nSI Prediction Project - Final Single R Script\n")
-cat(sprintf("Code directory: %s\n", PROJECT_DIR))
-
-resolve_project_base <- function() {
-  env_base <- Sys.getenv("SI_PROJECT_BASE", unset = "")
-  cloud_roots <- Sys.glob(file.path(path.expand("~"), "Library/CloudStorage", "GoogleDrive*"))
-  google_drive_bases <- unique(c(
-    file.path(cloud_roots, "My Drive", "SI_Prediction"),
-    file.path(cloud_roots, "Shared drives", "SI_Prediction"),
-    file.path(cloud_roots, "SI_Prediction")
-  ))
-  nearby_bases <- unique(c(
-    if (basename(PROJECT_DIR) == "1. Code") dirname(PROJECT_DIR) else character(0),
-    dirname(PROJECT_DIR),
-    PROJECT_DIR
-  ))
-  candidates <- unique(c(
-    if (nzchar(env_base)) env_base else character(0),
-    google_drive_bases,
-    nearby_bases
-  ))
-  candidates <- normalizePath(candidates, mustWork = FALSE)
-  is_project_root <- vapply(candidates, function(x) {
-    dir.exists(file.path(x, "2. Raw data")) ||
-      dir.exists(file.path(x, "3. Cleaned data")) ||
-      dir.exists(file.path(x, "4. Results"))
-  }, logical(1))
-  if (any(is_project_root)) return(candidates[which(is_project_root)[1]])
-  deep_hits <- unlist(lapply(cloud_roots, function(root) {
-    tryCatch(
-      list.files(root, pattern = "^SI_Prediction$", recursive = TRUE,
-                 full.names = TRUE, include.dirs = TRUE),
-      error = function(e) character()
-    )
-  }), use.names = FALSE)
-  deep_hits <- unique(normalizePath(deep_hits, mustWork = FALSE))
-  deep_is_project_root <- vapply(deep_hits, function(x) {
-    dir.exists(file.path(x, "2. Raw data")) ||
-      dir.exists(file.path(x, "3. Cleaned data")) ||
-      dir.exists(file.path(x, "4. Results"))
-  }, logical(1))
-  if (any(deep_is_project_root)) return(deep_hits[which(deep_is_project_root)[1]])
-  PROJECT_DIR
-}
-
-discover_project_roots <- function() {
-  env_base <- Sys.getenv("SI_PROJECT_BASE", unset = "")
-  cloud_roots <- Sys.glob(file.path(path.expand("~"), "Library/CloudStorage", "GoogleDrive*"))
-  roots <- unique(c(
-    if (nzchar(env_base)) env_base else character(0),
-    resolve_project_base(),
-    file.path(cloud_roots, "My Drive", "SI_Prediction"),
-    file.path(cloud_roots, "Shared drives", "SI_Prediction"),
-    file.path(cloud_roots, "SI_Prediction")
-  ))
-  deep_hits <- unlist(lapply(cloud_roots, function(root) {
-    tryCatch(
-      list.files(root, pattern = "^SI_Prediction$", recursive = TRUE,
-                 full.names = TRUE, include.dirs = TRUE),
-      error = function(e) character()
-    )
-  }), use.names = FALSE)
-  roots <- unique(normalizePath(c(roots, deep_hits), mustWork = FALSE))
-  roots[vapply(roots, dir.exists, logical(1))]
+ema_cols_for <- function(window, include_dynamic) {
+  types <- if (include_dynamic) c("mean", "dynamic") else "mean"
+  col_class %>%
+    filter(source == "ema", window == !!window, type %in% types) %>%
+    pull(col)
 }
 
 # ------------------------------------------------------------------------------
-# Shared dynamic-index helpers (Methods-aligned N thresholds)
+# 3. CANDIDATE FEATURE SETS PER CONFIGURATION
+#      EMA           -> 2 candidates (day1, day7)
+#      Passive       -> 4 candidates (hr1, hr4, day1, day7)
+#      EMA + Passive -> 4 candidates (EMA pooled across windows + each passive window)
 # ------------------------------------------------------------------------------
-# Mean (N >= 1)
-mean_thr <- function(x) {
-  x <- x[!is.na(x)]
-  if (length(x) < 1) return(NA_real_)
-  base::mean(x)
-}
-
-# MAD (N >= 2)
-mad_thr <- function(x) {
-  x <- x[!is.na(x)]
-  if (length(x) < 2) return(NA_real_)
-  stats::mad(x)
-}
-
-# P90-P10 relative position: (current_x - P10) / (P90 - P10).
-# P90 == P10 returns 0.5; values are not clipped.
-p90p10_relpos <- function(window_vals, current_x) {
-  window_vals <- window_vals[!is.na(window_vals)]
-  if (length(window_vals) < 20) return(NA_real_)
-  if (is.na(current_x)) return(NA_real_)
-  p10 <- unname(stats::quantile(window_vals, 0.10, type = 7))
-  p90 <- unname(stats::quantile(window_vals, 0.90, type = 7))
-  if (p90 == p10) return(0.5)
-  (current_x - p10) / (p90 - p10)
-}
-
-# Sample entropy (N >= 250; m = 2, r = 0.2 * SD)
-sample_entropy <- function(x) {
-  x <- x[!is.na(x)]
-  if (length(x) < 250) return(NA_real_)
-  r <- 0.2 * stats::sd(x)
-  if (is.na(r) || r == 0) return(NA_real_)
-  if (!requireNamespace("TSEntropies", quietly = TRUE)) return(NA_real_)
-  tryCatch(TSEntropies::FastSampEn(x, dim = 2, r = r), error = function(e) NA_real_)
-}
-
-if (RUN_DATA_CLEANING) {
-cat("\n===== OPTIONAL SECTION: DATA CLEANING =====\n")
-################################################################################
-# RUN ACCELERATION PROCESSING IN PARALLEL
-#
-# Computes ENMO, 10-second epochs, and dynamic indices with the 4-hour buffer.
-# Participant files are processed in parallel.
-# Resumable: each participant writes its own per-uid file; finished ones skip.
-################################################################################
-
-require_packages_or_stop("pbmcapply", "data cleaning")
-suppressPackageStartupMessages({
-  library(data.table); library(stringr); library(lubridate); library(parallel)
-  library(pbmcapply)
-})
-
-DEFAULT_DATA_PATH <- resolve_project_base()
-
-resolve_base_path <- function() {
-  existing_base <- if (exists("BASE_PATH", inherits = TRUE)) get("BASE_PATH", inherits = TRUE) else NA_character_
-  candidates <- unique(c(
-    Sys.getenv("SI_DATA_PATH", unset = NA_character_),
-    getwd(),
-    existing_base,
-    DEFAULT_DATA_PATH
-  ))
-  candidates <- candidates[!is.na(candidates) & nzchar(candidates) & dir.exists(candidates)]
-  has_ema <- candidates[
-    file.exists(file.path(candidates, "3. Cleaned data", "ema_features.csv")) |
-      file.exists(file.path(candidates, "ema_features.csv"))
-  ]
-  if (length(has_ema)) return(has_ema[1])
-  has_sensor_logs <- candidates[
-    file.exists(file.path(candidates, "2. Raw data", "smslog.csv")) |
-      file.exists(file.path(candidates, "2. Raw data", "calllog.csv")) |
-      file.exists(file.path(candidates, "smslog.csv")) |
-      file.exists(file.path(candidates, "calllog.csv"))
-  ]
-  if (length(has_sensor_logs)) return(has_sensor_logs[1])
-  if (!is.na(existing_base) && nzchar(existing_base)) return(existing_base)
-  getwd()
-}
-
-BASE_PATH <- resolve_base_path()
-CODE_DIR <- file.path(BASE_PATH, "1. Code")
-RAW_DATA_DIR <- file.path(BASE_PATH, "2. Raw data")
-CLEAN_DATA_DIR <- file.path(BASE_PATH, "3. Cleaned data")
-CLEAN_SENSOR_DIR <- file.path(CLEAN_DATA_DIR, "per_sensors")
-CLEAN_UID_DIR <- file.path(CLEAN_DATA_DIR, "per_uid")
-RESULTS_ROOT_DIR <- file.path(BASE_PATH, "4. Results")
-if (!exists("results_dir", inherits = TRUE)) {
-  results_dir <- file.path(RESULTS_ROOT_DIR, "report")
-}
-make_dirs(CLEAN_DATA_DIR, CLEAN_SENSOR_DIR, CLEAN_UID_DIR, results_dir)
-cat(sprintf("Using BASE_PATH: %s\n", BASE_PATH))
-
-normalize_uid <- function(x) {
-  raw <- trimws(as.character(x))
-  raw[raw %in% c("", "NA", "NaN", "NULL", "null")] <- NA_character_
-  before_at <- sub("@.*$", "", raw)
-  digits <- ifelse(grepl("^\\d{1,4}$", before_at), before_at, NA_character_)
-  digits[is.na(digits)] <- stringr::str_extract(raw[is.na(digits)], "(?<!\\d)\\d{1,4}(?!\\d)")
-  compact_digits <- gsub("\\D", "", raw)
-  has_compact <- is.na(digits) & !is.na(compact_digits) & nzchar(compact_digits)
-  digits[has_compact] <- compact_digits[has_compact]
-  fallback <- stringr::str_extract(raw, "^[^@_ -]+")
-  out <- ifelse(!is.na(digits), digits, fallback)
-  numeric_id <- !is.na(out) & grepl("^\\d+$", out)
-  out[numeric_id] <- ifelse(
-    nchar(out[numeric_id]) <= 4,
-    stringr::str_pad(out[numeric_id], width = 4, pad = "0"),
-    out[numeric_id]
-  )
-  out
-}
-
-parse_date_any <- function(x) {
-  raw <- as.character(x)
-  out <- suppressWarnings(as.Date(raw, format = "%Y-%m-%d"))
-  miss <- is.na(out)
-  out[miss] <- suppressWarnings(as.Date(raw[miss], format = "%m/%d/%Y"))
-  miss <- is.na(out)
-  out[miss] <- suppressWarnings(lubridate::ymd(raw[miss]))
-  miss <- is.na(out)
-  out[miss] <- suppressWarnings(lubridate::mdy(raw[miss]))
-  out
-}
-
-WORKERS      <- 10
-SEC_2020     <- 1577836800
-ACC_EPOCH_S  <- 10
-# Coverage is stored descriptively only. Window validity is governed by the
-# minimum-observation thresholds for each dynamic index and by participant-level
-# passive compliance criteria.
-data.table::setDTthreads(1) # 1 thread/worker -> avoid oversubscription across forks
-
-uid_default <- function(fp) {
-  b <- tools::file_path_sans_ext(basename(fp))
-  normalize_uid(b)
-}
-
-build_ema_lookup <- function(path = file.path(CLEAN_DATA_DIR, "ema_features.csv")) {
-  d <- data.table::fread(path)
-  if (!inherits(d$ema_day, "POSIXct")) {
-    raw <- as.character(d$ema_day)
-    p   <- suppressWarnings(as.POSIXct(raw, tz = "UTC"))
-    if (all(is.na(p))) p <- lubridate::ymd_hms(raw, tz = "UTC")
-    data.table::set(d, j = "ema_day", value = p)
+make_candidates <- function(config) {
+  out <- list()
+  add <- function(vars, ema_window, window) {
+    vars <- unique(vars)
+    if (length(vars) >= 2)
+      out[[length(out) + 1L]] <<- list(vars = vars, ema_window = ema_window, window = window)
   }
-  d <- d[!is.na(ema_day)]
-  if (!"uid" %in% names(d)) d[, uid := mlife_id]
-  d[, uid := normalize_uid(uid)]
-  d[, anchor_end := ema_day - 3600 * 4]
-  out <- d[, .(uid, ema_day, date_rep, ema_time, anchor_end)]
-  data.table::setkey(out, uid); out[]
+  
+  if (config == "Baseline") return(out)
+  
+  uses_ema     <- grepl("EMA", config, fixed = TRUE)
+  uses_passive <- grepl("Passive", config, fixed = TRUE)
+  dyn          <- grepl("dynamic", config, fixed = TRUE)
+  
+  if (uses_ema && !uses_passive) {
+    for (we in windows_ema) add(ema_cols_for(we, dyn), we, NA_character_)
+    
+  } else if (!uses_ema && uses_passive) {
+    for (w in windows_standard) add(passive_cols_for(w, dyn), NA_character_, w)
+    
+  } else {
+    ema_block <- unlist(lapply(windows_ema, ema_cols_for, include_dynamic = dyn))
+    for (w in windows_standard)
+      add(c(ema_block, passive_cols_for(w, dyn)), "all", w)
+  }
+  out
 }
-ema_lookup <- build_ema_lookup()
 
-read_acc <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp, select = c("data", "day")),
+CONFIGS <- c("Baseline", "EMA", "EMA (dynamic)", "Passive", "Passive (dynamic)",
+             "EMA + Passive", "EMA + Passive (dynamic)")
+
+# ------------------------------------------------------------------------------
+# 4. SLIDING-WINDOW CV
+#    train 45 days -> validate 10 days -> test 1 day, sliding forward 1 day.
+# ------------------------------------------------------------------------------
+SlidingWindow_CV_prereg <- function(data, train_days = 45, val_days = 10,
+                                    test_days = 1, ema_per_day = 3) {
+  n <- nrow(data)
+  train_n <- train_days * ema_per_day
+  val_n   <- val_days   * ema_per_day
+  test_n  <- test_days  * ema_per_day
+  if (n < train_n + val_n + test_n) return(NULL)
+  trains <- vals <- tests <- list(); k <- 1L; start <- 1L
+  while ((start + train_n + val_n + test_n - 1L) <= n) {
+    trains[[k]] <- start:(start + train_n - 1L)
+    vals[[k]]   <- (start + train_n):(start + train_n + val_n - 1L)
+    tests[[k]]  <- (start + train_n + val_n):(start + train_n + val_n + test_n - 1L)
+    k <- k + 1L; start <- start + test_n
+  }
+  if (!length(trains)) return(NULL)
+  list(trains = trains, vals = vals, tests = tests)
+}
+
+# ------------------------------------------------------------------------------
+# 4b. PER-FOLD PREPROCESSING HELPERS
+#     A column can pass the global >50%-missing rule applied during cleaning and
+#     still be all-NA or constant inside one participant's 45-day training
+#     window (verified: every participant has 6-19 such columns in the day7
+#     block). These screens are therefore per fold, not global.
+# ------------------------------------------------------------------------------
+MIN_NONMISSING <- 0.50   # share of non-missing values required within a fold
+
+usable_in <- function(cols, train_df, min_nonmissing = MIN_NONMISSING) {
+  cols <- intersect(cols, names(train_df))
+  if (!length(cols)) return(character(0))
+  keep <- vapply(cols, function(cc) {
+    x <- train_df[[cc]]
+    is.numeric(x) &&
+      mean(!is.na(x)) >= min_nonmissing &&
+      sum(!is.na(x)) >= 2 &&
+      stats::var(x, na.rm = TRUE) > 0
+  }, logical(1))
+  cols[keep]
+}
+
+# Near-zero-variance removal within each training fold (Methods 2.4.3).
+drop_near_zero_variance <- function(cols, train_df, freqCut = 19, uniqueCut = 10) {
+  cols <- intersect(cols, names(train_df))
+  if (length(cols) < 1) return(cols)
+  nzv <- tryCatch(caret::nearZeroVar(train_df[, cols, drop = FALSE],
+                                     freqCut = freqCut, uniqueCut = uniqueCut),
+                  error = function(e) integer(0))
+  if (length(nzv)) cols <- cols[-nzv]
+  cols
+}
+
+# KNN imputation needs rows complete across all selected columns; with many
+# partially-missing passive features no such rows exist, so fall back to median.
+fit_preprocess <- function(train_df, cols) {
+  pp <- tryCatch(caret::preProcess(train_df[, cols, drop = FALSE],
+                                   method = c("zv", "knnImpute")),
                  error = function(e) NULL)
-  if (is.null(dt) || !all(c("data", "day") %in% names(dt))) return(NULL)
-  dt[, c("x", "y", "z", "acc") :=
-       data.table::tstrsplit(gsub("[][]", "", data), ",", fixed = TRUE, type.convert = TRUE)]
-  dt[, vm   := sqrt(x^2 + y^2 + z^2)]
-  dt[, enmo := pmax(vm / 9.80665 - 1, 0)]
-  dt[, day  := as.POSIXct(as.character(day), tz = "UTC")]
-  dt <- dt[!is.na(enmo) & !is.na(day) & as.numeric(day) >= SEC_2020]
-  if (!nrow(dt)) return(NULL)
-  dt[, ep := floor(as.numeric(day) / 10) * 10]
-  agg <- dt[, .(signal = mean(enmo)), by = ep]
-  agg[, day := as.POSIXct(ep, origin = "1970-01-01", tz = "UTC")]
-  data.table::setkey(agg, day); agg[, .(day, signal)]
+  if (is.null(pp))
+    pp <- tryCatch(caret::preProcess(train_df[, cols, drop = FALSE],
+                                     method = c("zv", "medianImpute")),
+                   error = function(e) NULL)
+  pp
 }
-
-output_dir <- file.path(CLEAN_UID_DIR, "acc_per_uid")
-make_dirs(output_dir)
-WINDOWS <- list(hr1 = 3600, hr4 = 14400, day1 = 86400, day7 = 604800)
-
-# --- per-participant worker -----------------------------------------------------
-process_one_acc <- function(fp) {
-  uid_this <- stringr::str_pad(as.character(uid_default(fp)), width = 4, pad = "0")
-  out_path <- file.path(output_dir, sprintf("%s_dynamic_indices_acc.csv", uid_this))
-  if (file.exists(out_path)) return(paste("SKIP", uid_this))
-  tryCatch({
-    dt <- read_acc(fp)
-    if (is.null(dt) || !nrow(dt)) return(paste("EMPTY", uid_this))
-    ema_this <- ema_lookup[uid == uid_this]
-    if (!nrow(ema_this)) return(paste("NOEMA", uid_this))
-    max_t <- as.numeric(max(ema_this$anchor_end))
-    min_t <- as.numeric(min(ema_this$anchor_end)) - 604800
-    dt <- dt[as.numeric(day) >= min_t & as.numeric(day) <= max_t]
-    if (!nrow(dt)) return(paste("NORANGE", uid_this))
-    data.table::setkey(dt, day)
-    day_vec <- as.numeric(dt$day); sig_vec <- dt$signal
-    
-    out <- vector("list", nrow(ema_this) * length(WINDOWS)); k <- 1L
-    for (j in seq_len(nrow(ema_this))) {
-      ae <- as.numeric(ema_this$anchor_end[j])
-      cl <- findInterval(ae - 1800, day_vec); ch <- findInterval(ae, day_vec)
-      x_current <- mean_thr(if (ch > cl) sig_vec[(cl + 1L):ch] else numeric(0))
-      for (wn in names(WINDOWS)) {
-        ws <- WINDOWS[[wn]]
-        wl <- findInterval(ae - ws, day_vec); wh <- findInterval(ae, day_vec)
-        xc <- { x <- if (wh > wl) sig_vec[(wl + 1L):wh] else numeric(0); x[!is.na(x)] }
-        n_obs <- length(xc)
-        cov   <- min(n_obs / (ws / ACC_EPOCH_S), 1)
-        mean_v <- mean_thr(xc); sum_v <- if (n_obs) sum(xc) else NA_real_
-        mad_v <- mad_thr(xc); p_v <- p90p10_relpos(xc, x_current); ent_v <- sample_entropy(xc)
-        out[[k]] <- data.frame(
-          uid = ema_this$uid[j], ema_day = ema_this$ema_day[j],
-          date_rep = ema_this$date_rep[j], ema_time = ema_this$ema_time[j],
-          anchor_end = ema_this$anchor_end[j], window = wn,
-          n_obs = n_obs, coverage = cov, mean_val = mean_v, sum_val = sum_v,
-          mad_val = mad_v, p90p10 = p_v, entropy = ent_v)
-        k <- k + 1L
-      }
-    }
-    data.table::fwrite(data.table::rbindlist(out), out_path)
-    paste("DONE", uid_this, nrow(ema_this))
-  }, error = function(e) paste("ERROR", uid_this, conditionMessage(e)))
-}
-
-# --- run in parallel ------------------------------------------------------------
-acc_final_path <- file.path(CLEAN_SENSOR_DIR, "dynamic_indices_acc.csv")
-if (file.exists(acc_final_path)) {
-  cat("dynamic_indices_acc.csv already exists — skipping accelerometer processing\n")
-} else {
-  acc_files <- list.files(file.path(RAW_DATA_DIR, "acceleration"),
-                          pattern = "\\.csv$", full.names = TRUE)
-  cat(sprintf("acc files: %d | workers: %d\n", length(acc_files), WORKERS))
-  t0 <- proc.time()
-  # pbmclapply = mclapply + live progress bar/ETA; fall back to mclapply if needed
-  logs <- if (requireNamespace("pbmcapply", quietly = TRUE)) {
-    pbmcapply::pbmclapply(acc_files, process_one_acc,
-                          mc.cores = WORKERS, mc.preschedule = FALSE)
-  } else {
-    parallel::mclapply(acc_files, process_one_acc,
-                       mc.cores = WORKERS, mc.preschedule = FALSE)
-  }
-  cat(sprintf("Parallel acc done in %.1f min\n", (proc.time() - t0)["elapsed"] / 60))
-  
-  # status tally (DONE / SKIP / EMPTY / NOEMA / NORANGE / ERROR)
-  status <- sub(" .*", "", unlist(logs))
-  print(table(status))
-  errs <- grep("^ERROR", unlist(logs), value = TRUE)
-  if (length(errs)) { cat("\nErrors:\n"); print(head(errs, 20)) }
-  
-  # --- combine to dynamic_indices_acc.csv ----------------------------------------
-  done <- list.files(output_dir, pattern = "_dynamic_indices_acc\\.csv$", full.names = TRUE)
-  acc_res <- data.table::rbindlist(lapply(done, function(f)
-    data.table::fread(f, colClasses = list(character = "uid"))))
-  acc_res[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  data.table::fwrite(acc_res, acc_final_path)
-  cat(sprintf("\nSaved dynamic_indices_acc.csv: %d rows, %d participants\n",
-              nrow(acc_res), data.table::uniqueN(acc_res$uid)))
-  print(acc_res[, .(n = .N,
-                    mean_coverage  = round(mean(coverage, na.rm = TRUE), 2),
-                    pct_gated      = round(mean(is.na(mean_val)) * 100),
-                    pct_entropy_na = round(mean(is.na(entropy)) * 100)), by = window])
-}
-
-data.table::setDTthreads(0)   # restore default threading
-################################################################################
-
-
-################################################################################
-# GENERIC PARALLEL SENSOR RUNNER  (hr, steps, battery, convo, gps, gps_home)
-#
-# Sensor processing is parameterized by sensor specification and writes resumable
-# per-participant output files.
-# Coverage is stored descriptively only. Window validity is governed by the
-# minimum-observation thresholds for each dynamic index and by participant-level
-# passive compliance criteria.
-################################################################################
-
-require_packages_or_stop("pbmcapply", "data cleaning")
-suppressPackageStartupMessages({
-  library(data.table); library(stringr); library(lubridate)
-  library(parallel);   library(pbmcapply); library(geosphere)
-})
-
-SEC_2020     <- 1577836800
-WINDOWS      <- list(hr1 = 3600, hr4 = 14400, day1 = 86400, day7 = 604800)
-uid_default <- function(fp) {
-  b <- tools::file_path_sans_ext(basename(fp))
-  normalize_uid(b)
-}
-uid_convo   <- function(fp) stringr::str_extract(basename(fp), "(?<=convo_)[^@]+")
-
-parse_pydict <- function(s) {
-  if (is.na(s) || s == "") return(NULL)
-  s <- gsub("u'", "'", s, fixed = TRUE); s <- gsub("'", '"', s, fixed = TRUE)
-  tryCatch(jsonlite::fromJSON(s, simplifyVector = TRUE), error = function(e) NULL)
-}
-
-# --- anchors --------------------------------------------------------------------
-build_ema_lookup <- function(path = file.path(CLEAN_DATA_DIR, "ema_features.csv")) {
-  d <- data.table::fread(path)
-  if (!inherits(d$ema_day, "POSIXct")) {
-    raw <- as.character(d$ema_day); p <- suppressWarnings(as.POSIXct(raw, tz = "UTC"))
-    if (all(is.na(p))) p <- lubridate::ymd_hms(raw, tz = "UTC")
-    data.table::set(d, j = "ema_day", value = p)
-  }
-  d <- d[!is.na(ema_day)]
-  if (!"uid" %in% names(d)) d[, uid := mlife_id]
-  d[, uid := normalize_uid(uid)]
-  d[, anchor_end := ema_day - 3600 * 4]
-  out <- d[, .(uid, ema_day, date_rep, ema_time, anchor_end)]
-  data.table::setkey(out, uid); out[]
-}
-ema_lookup <- build_ema_lookup()
-cat(sprintf("ema_lookup: %d rows, %d uids\n", nrow(ema_lookup), data.table::uniqueN(ema_lookup$uid)))
-
-build_uid_alias_lookup <- function(path = file.path(CLEAN_DATA_DIR, "ema_features.csv")) {
-  d <- data.table::fread(path, colClasses = list(character = c("uid", "mlife_id")))
-  if (!"uid" %in% names(d) && !"mlife_id" %in% names(d)) return(setNames(character(0), character(0)))
-  canonical <- if ("uid" %in% names(d)) normalize_uid(d$uid) else normalize_uid(d$mlife_id)
-  alias_cols <- intersect(c("uid", "mlife_id"), names(d))
-  alias_rows <- data.table::rbindlist(lapply(alias_cols, function(col) {
-    raw <- trimws(as.character(d[[col]]))
-    data.table::data.table(
-      canonical_uid = canonical,
-      alias = c(raw, tolower(raw), normalize_uid(raw), tolower(normalize_uid(raw)),
-                stringr::str_extract(raw, "^[^@]+"), tolower(stringr::str_extract(raw, "^[^@]+")))
-    )
-  }), use.names = TRUE, fill = TRUE)
-  alias_rows <- alias_rows[!is.na(canonical_uid) & !is.na(alias) & nzchar(alias)]
-  alias_rows <- unique(alias_rows)
-  alias_rows <- alias_rows[!duplicated(alias)]
-  stats::setNames(alias_rows$canonical_uid, alias_rows$alias)
-}
-
-UID_ALIAS <- build_uid_alias_lookup()
-
-map_to_ema_uid <- function(x) {
-  raw <- trimws(as.character(x))
-  norm <- normalize_uid(raw)
-  keys <- list(raw, tolower(raw), norm, tolower(norm),
-               stringr::str_extract(raw, "^[^@]+"),
-               tolower(stringr::str_extract(raw, "^[^@]+")))
-  out <- rep(NA_character_, length(raw))
-  for (key in keys) {
-    hit <- !is.na(key) & key %in% names(UID_ALIAS) & is.na(out)
-    out[hit] <- UID_ALIAS[key[hit]]
-  }
-  out[is.na(out)] <- norm[is.na(out)]
-  out
-}
-
-# --- HOME LOCATIONS (reuse Dawson's validated homes; do NOT re-run DBSCAN) ------
-# Reads per-uid home_coords from time_at_home.csv (column "home_coords" holds a
-# python list of (lat, lon) tuples, incl. the hand-assigned ones). Builds a
-# named list HOME_COORDS[[uid]] = matrix(cols = lat, lon).
-DERIVED_HOME_FILE <- file.path(CLEAN_DATA_DIR, "homes_derived.csv")   # from SI_derive_homes.R
-HOME_FILE         <- file.path(CLEAN_DATA_DIR, "time_at_home.csv")    # Dawson's output (fallback)
-
-load_home_coords <- function() {
-  # 1) preferred: homes_derived.csv (long: uid, home_lat, home_lon)
-  if (file.exists(DERIVED_HOME_FILE)) {
-    d <- data.table::fread(DERIVED_HOME_FILE, colClasses = list(character = "uid"))
-    d[, uid := stringr::str_pad(uid, 4, pad = "0")]
-    L <- lapply(split(d, d$uid), function(x) {
-      m <- as.matrix(x[, .(home_lat, home_lon)]); colnames(m) <- c("lat", "lon"); m
-    })
-    cat(sprintf("homes loaded from homes_derived.csv for %d participants\n", length(L)))
-    return(L)
-  }
-  # 2) fallback: parse home_coords tuples from time_at_home.csv
-  if (file.exists(HOME_FILE)) {
-    d <- unique(data.table::fread(HOME_FILE, select = c("uid", "home_coords")), by = "uid")
-    L <- lapply(seq_len(nrow(d)), function(i) {
-      nums <- suppressWarnings(as.numeric(unlist(
-        regmatches(as.character(d$home_coords[i]),
-                   gregexpr("-?[0-9]+\\.?[0-9]*(?:[eE]-?[0-9]+)?", as.character(d$home_coords[i]))))))
-      nums <- nums[!is.na(nums)]
-      if (length(nums) < 2) return(NULL)
-      m <- matrix(nums[1:(2 * (length(nums) %/% 2))], ncol = 2, byrow = TRUE)
-      colnames(m) <- c("lat", "lon"); m
-    })
-    names(L) <- stringr::str_pad(stringr::str_extract(d$uid, "^[^@]+"), 4, pad = "0")
-    cat(sprintf("homes loaded from time_at_home.csv for %d participants\n",
-                sum(!vapply(L, is.null, logical(1)))))
-    return(L)
-  }
-  cat("WARN: no home file found (run SI_derive_homes.R first) -> gps_home will be EMPTY\n")
-  list()
-}
-HOME_COORDS <- load_home_coords()
-
-# ==============================================================================
-# READERS  -> each returns data.table(day = POSIXct UTC, signal = numeric)
-# ==============================================================================
-read_hr <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(dt) || !all(c("data","day") %in% names(dt))) return(NULL)
-  dt[, day := as.POSIXct(as.character(day), tz = "UTC")]
-  dt[, signal := suppressWarnings(as.numeric(data))]
-  dt <- dt[!is.na(day) & as.numeric(day) >= SEC_2020 &
-             !is.na(signal) & signal >= 30 & signal <= 220]
-  if (!nrow(dt)) return(NULL)
-  data.table::setkey(dt, day); dt[, .(day, signal)]
-}
-
-read_steps <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(dt) || !"data" %in% names(dt)) return(NULL)
-  m <- stringr::str_match(dt$data,
-                          "\\[\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*\\]")
-  out <- data.table::data.table(
-    signal = suppressWarnings(as.numeric(m[, 2])),     # step count (element 1)
-    epoch  = suppressWarnings(as.numeric(m[, 5])))     # UTC epoch (element 4)
-  out[, day := as.POSIXct(epoch, origin = "1970-01-01", tz = "UTC")]
-  out <- out[!is.na(day) & as.numeric(day) >= SEC_2020 & !is.na(signal) & signal >= 0]
-  if (!nrow(out)) return(NULL)
-  data.table::setkey(out, day); out[, .(day, signal)]
-}
-
-read_battery <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(dt) || !all(c("data","day") %in% names(dt))) return(NULL)
-  dt[, day := as.POSIXct(as.character(day), tz = "UTC")]
-  dt[, signal := suppressWarnings(as.numeric(data))]
-  dt <- dt[!is.na(day) & as.numeric(day) >= SEC_2020 &
-             !is.na(signal) & signal >= 0 & signal <= 100]
-  if (!nrow(dt)) return(NULL)
-  data.table::setkey(dt, day); dt[, .(day, signal)]
-}
-
-read_convo <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(dt) || !"event_data" %in% names(dt)) return(NULL)
-  nums  <- stringr::str_extract_all(dt$event_data, "\\d+")
-  start <- suppressWarnings(as.numeric(vapply(nums, function(z) z[1], character(1)))) / 1000
-  end   <- suppressWarnings(as.numeric(vapply(nums, function(z) z[2], character(1)))) / 1000
-  ev <- data.table::data.table(t = start, dur = end - start)
-  ev <- ev[!is.na(t) & !is.na(dur) & dur >= 0 & dur <= 24*3600 & t >= SEC_2020]
-  if (!nrow(ev)) return(NULL)
-  ev[, bin := floor(t / 300) * 300]                         # 5-min epochs
-  b <- ev[, .(signal = sum(dur)), by = bin]
-  b[, day := as.POSIXct(bin, origin = "1970-01-01", tz = "UTC")]
-  data.table::setkey(b, day); b[, .(day, signal)]
-}
-
-pick_col <- function(nms, patterns) {
-  hit <- nms[Reduce(`|`, lapply(patterns, function(p) grepl(p, nms, ignore.case = TRUE)))]
-  if (length(hit)) hit[1] else NA_character_
-}
-
-extract_uid_values <- function(dt) {
-  uid_col <- pick_col(names(dt), c("^uid$", "mlife_id", "participant", "subject", "user"))
-  if (is.na(uid_col)) return(NULL)
-  map_to_ema_uid(dt[[uid_col]])
-}
-
-parse_event_time <- function(x) {
-  if (inherits(x, "POSIXct")) return(x)
-  xn <- suppressWarnings(as.numeric(x))
-  if (any(is.finite(xn), na.rm = TRUE)) {
-    if (stats::median(xn, na.rm = TRUE) > 1e12) xn <- xn / 1000
-    return(as.POSIXct(xn, origin = "1970-01-01", tz = "UTC"))
-  }
-  suppressWarnings(as.POSIXct(as.character(x), tz = "UTC"))
-}
-
-read_sms <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(dt) || !nrow(dt)) return(NULL)
-  nms <- names(dt)
-  time_col <- pick_col(nms, c("^day$", "timestamp", "time", "date", "created"))
-  if (is.na(time_col)) return(NULL)
-  body_col <- pick_col(nms, c("body", "message", "text", "content", "^data$"))
-  len_col  <- pick_col(nms, c("body_len", "message_len", "text_len", "length", "char", "chars"))
-  uid <- extract_uid_values(dt)
-  if (!is.null(uid)) dt[, uid := uid]
-  dt[, day := parse_event_time(get(time_col))]
-  if (!is.na(len_col) && suppressWarnings(any(is.finite(as.numeric(dt[[len_col]])), na.rm = TRUE))) {
-    dt[, signal := suppressWarnings(as.numeric(get(len_col)))]
-  } else if (!is.na(body_col)) {
-    dt[, signal := nchar(as.character(get(body_col)), type = "chars", allowNA = TRUE)]
-  } else {
-    dt[, signal := 1]
-  }
-  dt <- dt[!is.na(day) & as.numeric(day) >= SEC_2020 & !is.na(signal) & signal >= 0]
-  if (!nrow(dt)) return(NULL)
-  dt[, bin := floor(as.numeric(day) / 1800) * 1800]             # 30-min epochs
-  by_cols <- if ("uid" %in% names(dt)) c("uid", "bin") else "bin"
-  out <- dt[, .(signal = sum(signal, na.rm = TRUE)), by = by_cols]  # body length/count per epoch
-  out[, day := as.POSIXct(bin, origin = "1970-01-01", tz = "UTC")]
-  data.table::setkey(out, day)
-  if ("uid" %in% names(out)) out[, .(uid, day, signal)] else out[, .(day, signal)]
-}
-
-read_calls <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(dt) || !nrow(dt)) return(NULL)
-  nms <- names(dt)
-  time_col <- pick_col(nms, c("^day$", "timestamp", "start", "time", "date", "created"))
-  dur_col  <- pick_col(nms, c("duration", "dur", "length", "seconds", "sec"))
-  end_col  <- pick_col(nms, c("end", "stop"))
-  data_col <- pick_col(nms, c("^data$", "event_data"))
-  if (is.na(time_col)) return(NULL)
-  uid <- extract_uid_values(dt)
-  if (!is.null(uid)) dt[, uid := uid]
-  dt[, day := parse_event_time(get(time_col))]
-  if (!is.na(dur_col) && suppressWarnings(any(is.finite(as.numeric(dt[[dur_col]])), na.rm = TRUE))) {
-    dt[, signal := suppressWarnings(as.numeric(get(dur_col)))]
-  } else if (!is.na(end_col)) {
-    dt[, signal := as.numeric(parse_event_time(get(end_col)) - day, units = "secs")]
-  } else if (!is.na(data_col)) {
-    nums <- stringr::str_extract_all(as.character(dt[[data_col]]), "\\d+")
-    dt[, signal := suppressWarnings(as.numeric(vapply(nums, function(z) {
-      if (length(z) >= 2) {
-        a <- as.numeric(z[1]); b <- as.numeric(z[2])
-        if (max(a, b, na.rm = TRUE) > 1e12) {
-          abs(b - a) / 1000
-        } else {
-          abs(b - a)
-        }
-      } else if (length(z) == 1) {
-        as.numeric(z[1])
-      } else {
-        NA_real_
-      }
-    }, numeric(1))))]
-  } else {
-    dt[, signal := 0]
-  }
-  dt <- dt[!is.na(day) & as.numeric(day) >= SEC_2020 &
-             !is.na(signal) & signal >= 0 & signal <= 24*3600]
-  if (!nrow(dt)) return(NULL)
-  dt[, bin := floor(as.numeric(day) / 1800) * 1800]             # 30-min epochs
-  by_cols <- if ("uid" %in% names(dt)) c("uid", "bin") else "bin"
-  out <- dt[, .(signal = sum(signal, na.rm = TRUE)), by = by_cols]  # total call duration per epoch
-  out[, day := as.POSIXct(bin, origin = "1970-01-01", tz = "UTC")]
-  data.table::setkey(out, day)
-  if ("uid" %in% names(out)) out[, .(uid, day, signal)] else out[, .(day, signal)]
-}
-
-read_stress <- function(fp) {
-  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  need <- c("calendarDate","startTimeInSeconds","durationInSeconds","timeOffsetStressLevelValues")
-  if (is.null(dt) || !all(need %in% names(dt))) return(NULL)
-  data.table::setorder(dt, calendarDate, -durationInSeconds)
-  dt <- dt[!duplicated(calendarDate)]                       # dedup per day
-  rows <- lapply(seq_len(nrow(dt)), function(i) {
-    v <- parse_pydict(dt$timeOffsetStressLevelValues[i])
-    if (is.null(v) || !length(v)) return(NULL)
-    off <- suppressWarnings(as.numeric(names(v))); lvl <- suppressWarnings(as.numeric(v))
-    keep <- !is.na(off) & !is.na(lvl) & lvl >= 0 & lvl <= 100   # drop -1/-2 no-data
-    if (!any(keep)) return(NULL)
-    data.table::data.table(
-      day = as.POSIXct(dt$startTimeInSeconds[i] + off[keep], origin = "1970-01-01", tz = "UTC"),
-      signal = lvl[keep])
-  })
-  out <- data.table::rbindlist(rows)
-  if (!nrow(out)) return(NULL)
-  data.table::setkey(out, day); out[]
-}
-
-# --- GPS: LATITUDE/LONGITUDE/ACCURACY/DAY -> distance traveled / 30-min epoch ----
-#   distance = haversine between consecutive fixes (meters), summed per 30-min bin.
-#   Filters low-accuracy fixes and caps implausible-speed jumps (GPS error).
-read_gps <- function(fp, max_accuracy_m = 100, max_speed_ms = 70) {
-  d <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(d)) return(NULL)
-  data.table::setnames(d, toupper(names(d)))
-  if (!all(c("LATITUDE", "LONGITUDE", "DAY") %in% names(d))) return(NULL)
-  d[, day := as.POSIXct(as.character(DAY), tz = "UTC")]
-  d[, lat := suppressWarnings(as.numeric(LATITUDE))]
-  d[, lon := suppressWarnings(as.numeric(LONGITUDE))]
-  d[, acc := if ("ACCURACY" %in% names(d)) suppressWarnings(as.numeric(ACCURACY)) else NA_real_]
-  d <- d[!is.na(day) & as.numeric(day) >= SEC_2020 & !is.na(lat) & !is.na(lon) &
-           lat >= -90 & lat <= 90 & lon >= -180 & lon <= 180 &
-           (is.na(acc) | acc <= max_accuracy_m)]
-  if (nrow(d) < 2) return(NULL)
-  data.table::setkey(d, day); n <- nrow(d)
-  dist <- c(0, geosphere::distHaversine(cbind(d$lon[-n], d$lat[-n]),
-                                        cbind(d$lon[-1], d$lat[-1])))   # meters
-  tgap <- c(NA, diff(as.numeric(d$day)))                               # seconds
-  spd  <- dist / tgap
-  dist[!is.na(spd) & spd > max_speed_ms] <- NA                         # drop GPS jumps
-  d[, dist_m := dist]
-  d[, ep := floor(as.numeric(day) / 1800) * 1800]                      # 30-min epoch
-  out <- d[, .(signal = sum(dist_m, na.rm = TRUE)), by = ep]           # total m/epoch
-  out[, day := as.POSIXct(ep, origin = "1970-01-01", tz = "UTC")]
-  data.table::setkey(out, day); out[, .(day, signal)]
-}
-
-# --- GPS TIME-AT-HOME: fraction of fixes within 40m of home x 1800 = sec/epoch --
-#   Reuses Dawson's per-uid home_coords (HOME_COORDS), applies the 40m flag to
-#   raw_gps_clean fixes (haversine ~ geodesic at this scale), aggregates per
-#   30-min epoch. signal = seconds at home per epoch (0..1800).
-read_gps_home <- function(fp, radius_m = 40, max_accuracy_m = 100) {
-  uid_this <- stringr::str_pad(uid_default(fp), 4, pad = "0")
-  homes <- HOME_COORDS[[uid_this]]
-  if (is.null(homes) || !nrow(homes)) return(NULL)        # no home -> no TAH
-  d <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-  if (is.null(d)) return(NULL)
-  data.table::setnames(d, toupper(names(d)))
-  if (!all(c("LATITUDE", "LONGITUDE", "DAY") %in% names(d))) return(NULL)
-  d[, day := as.POSIXct(as.character(DAY), tz = "UTC")]
-  d[, lat := suppressWarnings(as.numeric(LATITUDE))]
-  d[, lon := suppressWarnings(as.numeric(LONGITUDE))]
-  d[, acc := if ("ACCURACY" %in% names(d)) suppressWarnings(as.numeric(ACCURACY)) else NA_real_]
-  d <- d[!is.na(day) & as.numeric(day) >= SEC_2020 & !is.na(lat) & !is.na(lon) &
-           (is.na(acc) | acc <= max_accuracy_m)]
-  if (!nrow(d)) return(NULL)
-  pts <- cbind(d$lon, d$lat)
-  is_home <- rep(FALSE, nrow(d))
-  for (h in seq_len(nrow(homes)))
-    is_home <- is_home | (geosphere::distHaversine(pts, c(homes[h, "lon"], homes[h, "lat"])) <= radius_m)
-  d[, ih := as.integer(is_home)]
-  d[, ep := floor(as.numeric(day) / 1800) * 1800]
-  out <- d[, .(signal = mean(ih) * 1800), by = ep]        # seconds at home / epoch
-  out[, day := as.POSIXct(ep, origin = "1970-01-01", tz = "UTC")]
-  data.table::setkey(out, day); out[, .(day, signal)]
-}
-
-# ==============================================================================
-# CORE: compute dynamic indices for one participant's (day, signal) series
-# ==============================================================================
-compute_indices <- function(day_vec, sig_vec, ema_this, epoch_sec,
-                            windows = WINDOWS) {
-  out <- vector("list", nrow(ema_this) * length(windows)); k <- 1L
-  for (j in seq_len(nrow(ema_this))) {
-    ae <- as.numeric(ema_this$anchor_end[j])
-    cl <- findInterval(ae - 1800, day_vec); ch <- findInterval(ae, day_vec)
-    x_current <- mean_thr(if (ch > cl) sig_vec[(cl + 1L):ch] else numeric(0))
-    for (wn in names(windows)) {
-      ws <- windows[[wn]]
-      wl <- findInterval(ae - ws, day_vec); wh <- findInterval(ae, day_vec)
-      xc <- { x <- if (wh > wl) sig_vec[(wl + 1L):wh] else numeric(0); x[!is.na(x)] }
-      n_obs <- length(xc)
-      cov   <- if (!is.na(epoch_sec)) min(n_obs / (ws / epoch_sec), 1) else NA_real_
-      mean_v <- mean_thr(xc); sum_v <- if (n_obs) sum(xc) else NA_real_
-      mad_v <- mad_thr(xc); p_v <- p90p10_relpos(xc, x_current); ent_v <- sample_entropy(xc)
-      out[[k]] <- data.frame(
-        uid = ema_this$uid[j], ema_day = ema_this$ema_day[j],
-        date_rep = ema_this$date_rep[j], ema_time = ema_this$ema_time[j],
-        anchor_end = ema_this$anchor_end[j], window = wn,
-        n_obs = n_obs, coverage = cov, mean_val = mean_v, sum_val = sum_v,
-        mad_val = mad_v, p90p10 = p_v, entropy = ent_v)
-      k <- k + 1L
-    }
-  }
-  data.table::rbindlist(out)
-}
-
-# --- one participant -> writes per-uid csv, returns status ----------------------
-process_one <- function(fp, spec) {
-  uid_this <- stringr::str_pad(as.character(spec$uid_fn(fp)), width = 4, pad = "0")
-  out_dir  <- file.path(CLEAN_UID_DIR, paste0(spec$tag, "_per_uid"))
-  out_path <- file.path(out_dir, sprintf("%s_dynamic_indices_%s.csv", uid_this, spec$tag))
-  if (file.exists(out_path)) return(paste("SKIP", uid_this))
-  tryCatch({
-    dt <- spec$read(fp)
-    if (is.null(dt) || !nrow(dt)) return(paste("EMPTY", uid_this))
-    ema_this <- ema_lookup[uid == uid_this]
-    if (!nrow(ema_this)) return(paste("NOEMA", uid_this))
-    min_t <- as.numeric(min(ema_this$anchor_end)) - 604800
-    max_t <- as.numeric(max(ema_this$anchor_end))
-    dt <- dt[as.numeric(day) >= min_t & as.numeric(day) <= max_t]
-    if (!nrow(dt)) return(paste("NORANGE", uid_this))
-    data.table::setkey(dt, day)
-    res <- compute_indices(as.numeric(dt$day), dt$signal, ema_this, spec$epoch_sec)
-    make_dirs(out_dir)
-    data.table::fwrite(res, out_path)
-    paste("DONE", uid_this, nrow(ema_this))
-  }, error = function(e) paste("ERROR", uid_this, conditionMessage(e)))
-}
-
-sensor_search_roots <- function() {
-  roots <- c(
-    RAW_DATA_DIR,
-    CLEAN_SENSOR_DIR,
-    CLEAN_DATA_DIR,
-    BASE_PATH,
-    Sys.getenv("SI_DATA_PATH", unset = NA_character_),
-    resolve_project_base()
-  )
-  unique(roots[!is.na(roots) & nzchar(roots) & dir.exists(roots)])
-}
-
-sensor_path_candidates <- function(folder) {
-  if (grepl("^/", folder) || grepl("^[A-Za-z]:", folder)) {
-    direct <- folder
-    with_ext <- if (grepl("\\.csv$", folder, ignore.case = TRUE)) direct else paste0(direct, ".csv")
-    return(unique(c(direct, with_ext)))
-  }
-  unique(unlist(lapply(sensor_search_roots(), function(root) {
-    direct <- file.path(root, folder)
-    with_ext <- if (grepl("\\.csv$", folder, ignore.case = TRUE)) direct else paste0(direct, ".csv")
-    c(direct, with_ext)
-  }), use.names = FALSE))
-}
-
-case_insensitive_csv_matches <- function(folder) {
-  stem <- tools::file_path_sans_ext(basename(folder))
-  roots <- sensor_search_roots()
-  unique(unlist(lapply(roots, function(root) {
-    if (!dir.exists(root)) return(character(0))
-    list.files(root, pattern = paste0("^", stem, "\\.csv$"),
-               full.names = TRUE, ignore.case = TRUE)
-  }), use.names = FALSE))
-}
-
-list_sensor_files <- function(spec) {
-  candidates <- unique(c(
-    unlist(lapply(spec$folder, sensor_path_candidates), use.names = FALSE),
-    unlist(lapply(spec$folder, case_insensitive_csv_matches), use.names = FALSE)
-  ))
-  files <- candidates[file.exists(candidates) & !dir.exists(candidates)]
-  dirs <- candidates[dir.exists(candidates)]
-  if (length(dirs)) {
-    files <- c(files, unlist(lapply(dirs, list.files, pattern = "\\.csv$", full.names = TRUE),
-                             use.names = FALSE))
-  }
-  unique(files)
-}
-
-inspect_sensor_input_files <- function(folders = c("sleep", "smslog", "calllog"), n = 3) {
-  cat(sprintf("Search roots:\n  %s\n", paste(sensor_search_roots(), collapse = "\n  ")))
-  out <- lapply(folders, function(folder) {
-    paths <- unique(c(sensor_path_candidates(folder), case_insensitive_csv_matches(folder)))
-    files <- paths[file.exists(paths) & !dir.exists(paths)]
-    dirs <- paths[dir.exists(paths)]
-    if (length(dirs)) {
-      files <- c(files, unlist(lapply(dirs, list.files, pattern = "\\.csv$", full.names = TRUE),
-                               use.names = FALSE))
-    }
-    files <- unique(files)
-    cat(sprintf("\n[%s] %d CSV files\n", folder, length(files)))
-    if (!length(files)) return(data.table::data.table(folder = folder, files = 0L))
-    rows <- lapply(utils::head(files, n), function(fp) {
-      d <- tryCatch(data.table::fread(fp, nrows = 0), error = function(e) NULL)
-      cols <- if (is.null(d)) "<cannot read>" else paste(names(d), collapse = ", ")
-      cat(sprintf("  %s\n    uid guess: %s\n    columns: %s\n",
-                  basename(fp), uid_default(fp), cols))
-      data.table::data.table(
-        folder = folder,
-        file = basename(fp),
-        uid_guess = uid_default(fp),
-        columns = cols
-      )
-    })
-    data.table::rbindlist(rows, use.names = TRUE, fill = TRUE)
-  })
-  res <- data.table::rbindlist(out, use.names = TRUE, fill = TRUE)
-  out_csv <- file.path(results_dir, "sensor_input_file_inspection.csv")
-  make_dirs(dirname(out_csv))
-  data.table::fwrite(res, out_csv)
-  invisible(res)
-}
-
-diagnose_event_uid_overlap <- function(spec) {
-  files <- list_sensor_files(spec)
-  cat(sprintf("\n=== UID overlap diagnostic: %s ===\n", spec$tag))
-  cat(sprintf("Files found: %d\n", length(files)))
-  if (!length(files)) return(invisible(NULL))
-  dt <- data.table::rbindlist(lapply(files, spec$read), use.names = TRUE, fill = TRUE)
-  if (!nrow(dt)) {
-    cat("Reader returned zero usable rows after parsing time, uid, and signal.\n")
-    return(invisible(NULL))
-  }
-  if (!"uid" %in% names(dt)) {
-    cat("Reader output does not include uid. Check the source ID column name.\n")
-    return(invisible(NULL))
-  }
-  dt[, uid := map_to_ema_uid(uid)]
-  event_uids <- sort(unique(dt[!is.na(uid), uid]))
-  ema_uids <- sort(unique(ema_lookup[!is.na(uid), uid]))
-  overlap <- intersect(event_uids, ema_uids)
-  cat(sprintf("Event UIDs: %d | EMA UIDs: %d | overlap: %d\n",
-              length(event_uids), length(ema_uids), length(overlap)))
-  cat(sprintf("Event time range: %s .. %s\n", min(dt$day, na.rm = TRUE), max(dt$day, na.rm = TRUE)))
-  cat(sprintf("EMA anchor range: %s .. %s\n", min(ema_lookup$anchor_end, na.rm = TRUE),
-              max(ema_lookup$anchor_end, na.rm = TRUE)))
-  if (!length(overlap)) {
-    cat("No UID overlap after EMA alias mapping. Compare these locally:\n")
-    cat(sprintf("  event uid examples: %s\n", paste(utils::head(event_uids, 10), collapse = ", ")))
-    cat(sprintf("  EMA uid examples:   %s\n", paste(utils::head(ema_uids, 10), collapse = ", ")))
-  }
-  invisible(list(event_uids = event_uids, ema_uids = ema_uids, overlap = overlap))
-}
-
-# ==============================================================================
-# test_one(): verify a reader on ONE participant (prints, does not write)
-# ==============================================================================
-test_one <- function(spec, uid_sel = "0011") {
-  files <- list_sensor_files(spec)
-  if (isTRUE(spec$combined_file)) {
-    cat(sprintf("\n=== TEST %s (uid %s) ===\n", spec$tag, uid_sel))
-    if (!length(files)) { cat("  no combined file found\n"); return(invisible()) }
-    dt <- data.table::rbindlist(lapply(files, spec$read), use.names = TRUE, fill = TRUE)
-    if (is.null(dt) || !nrow(dt) || !"uid" %in% names(dt)) {
-      cat("  reader returned EMPTY or no uid column\n")
-      return(invisible())
-    }
-    dt[, uid := map_to_ema_uid(uid)]
-    dt <- dt[uid == uid_sel]
-    if (!nrow(dt)) { cat("  no events for this uid in combined file\n"); return(invisible()) }
-    cat(sprintf("  combined files: %d\n  signal rows: %d | range: %s .. %s\n",
-                length(files), nrow(dt), min(dt$day), max(dt$day)))
-    print(summary(dt$signal))
-    ema_this <- ema_lookup[uid == uid_sel]
-    if (!nrow(ema_this)) { cat("  no EMA for this uid\n"); return(invisible()) }
-    min_t <- as.numeric(min(ema_this$anchor_end)) - 604800
-    max_t <- as.numeric(max(ema_this$anchor_end))
-    dt <- dt[as.numeric(day) >= min_t & as.numeric(day) <= max_t]
-    data.table::setkey(dt, day)
-    res <- compute_indices(as.numeric(dt$day), dt$signal, ema_this, spec$epoch_sec)
-    print(utils::head(res))
-    print(res[, .(n = .N, mean_cov = round(mean(coverage, na.rm = TRUE), 2),
-                  pct_gated = round(mean(is.na(mean_val)) * 100),
-                  pct_ent_na = round(mean(is.na(entropy)) * 100)), by = window])
-    return(invisible(res))
-  }
-  hit <- files[stringr::str_pad(as.character(vapply(files, spec$uid_fn, character(1))), width = 4, pad = "0") == uid_sel]
-  cat(sprintf("\n=== TEST %s (uid %s) ===\n", spec$tag, uid_sel))
-  if (!length(hit)) { cat("  no file for this uid\n"); return(invisible()) }
-  dt <- spec$read(hit[1])
-  if (is.null(dt) || !nrow(dt)) { cat("  reader returned EMPTY\n"); return(invisible()) }
-  cat(sprintf("  file: %s\n  signal rows: %d | range: %s .. %s\n",
-              basename(hit[1]), nrow(dt), min(dt$day), max(dt$day)))
-  print(summary(dt$signal))
-  ema_this <- ema_lookup[uid == uid_sel]
-  if (!nrow(ema_this)) { cat("  no EMA for this uid\n"); return(invisible()) }
-  min_t <- as.numeric(min(ema_this$anchor_end)) - 604800
-  max_t <- as.numeric(max(ema_this$anchor_end))
-  dt <- dt[as.numeric(day) >= min_t & as.numeric(day) <= max_t]
-  data.table::setkey(dt, day)
-  res <- compute_indices(as.numeric(dt$day), dt$signal, ema_this, spec$epoch_sec)
-  print(utils::head(res))
-  print(res[, .(n = .N, mean_cov = round(mean(coverage, na.rm = TRUE), 2),
-                pct_gated = round(mean(is.na(mean_val)) * 100),
-                pct_ent_na = round(mean(is.na(entropy)) * 100)), by = window])
-  invisible(res)
-}
-
-# ==============================================================================
-# run_full(): parallel scale-up for one sensor
-# ==============================================================================
-run_full <- function(spec, workers = 10, force = FALSE) {
-  final_path <- file.path(CLEAN_SENSOR_DIR, sprintf("dynamic_indices_%s.csv", spec$tag))
-  if (file.exists(final_path) && !force) {
-    cat(sprintf("dynamic_indices_%s.csv already exists — skipping %s processing\n",
-                spec$tag, spec$tag))
-    return(invisible(data.table::fread(final_path, colClasses = list(character = "uid"))))
-  }
-  if (force && file.exists(final_path)) {
-    cat(sprintf("force=TRUE — recalculating %s and replacing %s\n", spec$tag, basename(final_path)))
-    unlink(final_path)
-    unlink(file.path(CLEAN_UID_DIR, paste0(spec$tag, "_per_uid")), recursive = TRUE)
-  }
-  files <- list_sensor_files(spec)
-  if (!length(files)) {
-    cat(sprintf("%s: no CSV files found in %s — skipping\n",
-                spec$tag, paste(spec$folder, collapse = ", ")))
-    return(invisible(NULL))
-  }
-  if (isTRUE(spec$combined_file)) {
-    cat(sprintf("%s: %d combined CSV file(s)\n", spec$tag, length(files)))
-    dt <- data.table::rbindlist(lapply(files, spec$read), use.names = TRUE, fill = TRUE)
-    if (!nrow(dt)) {
-      cat(sprintf("%s: reader returned no event rows\n", spec$tag))
-      return(invisible(NULL))
-    }
-    if (!all(c("uid", "day", "signal") %in% names(dt))) {
-      stop(sprintf("%s reader must return uid, day, and signal for combined files. Run inspect_sensor_input_files() and check the ID column name.",
-                   spec$tag))
-    }
-    dt <- dt[!is.na(uid) & !is.na(day) & !is.na(signal)]
-    dt[, uid := map_to_ema_uid(uid)]
-    data.table::setkey(dt, uid, day)
-    uids <- intersect(unique(dt$uid), unique(ema_lookup$uid))
-    cat(sprintf("%s: %d PTs with events and EMA anchors\n", spec$tag, length(uids)))
-    out_list <- vector("list", length(uids))
-    for (i in seq_along(uids)) {
-      uid_this <- uids[i]
-      dt_this <- dt[uid == uid_this]
-      ema_this <- ema_lookup[uid == uid_this]
-      min_t <- as.numeric(min(ema_this$anchor_end)) - 604800
-      max_t <- as.numeric(max(ema_this$anchor_end))
-      dt_this <- dt_this[as.numeric(day) >= min_t & as.numeric(day) <= max_t]
-      if (!nrow(dt_this)) next
-      data.table::setkey(dt_this, day)
-      out_list[[i]] <- compute_indices(as.numeric(dt_this$day), dt_this$signal,
-                                       ema_this, spec$epoch_sec)
-    }
-    final <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
-    if (!nrow(final)) {
-      cat(sprintf("%s: no rows overlapped EMA windows\n", spec$tag))
-      return(invisible(NULL))
-    }
-    final[, uid := map_to_ema_uid(uid)]
-    data.table::fwrite(final, final_path)
-    cat(sprintf("Saved dynamic_indices_%s.csv: %d rows, %d PTs\n",
-                spec$tag, nrow(final), data.table::uniqueN(final$uid)))
-    return(invisible(final))
-  }
-  uids  <- stringr::str_pad(as.character(vapply(files, spec$uid_fn, character(1))), width = 4, pad = "0")
-  if (anyDuplicated(uids))
-    cat(sprintf("WARN %s: %d files, %d unique uids — dups would be skipped\n",
-                spec$tag, length(files), length(unique(uids))))
-  cat(sprintf("%s: %d files | %d workers\n", spec$tag, length(files), workers))
-  data.table::setDTthreads(1)
-  logs <- pbmcapply::pbmclapply(files, process_one, spec = spec,
-                                mc.cores = workers, mc.preschedule = FALSE)
-  data.table::setDTthreads(0)
-  print(table(sub(" .*", "", unlist(logs))))
-  errs <- grep("^ERROR", unlist(logs), value = TRUE); if (length(errs)) print(head(errs, 10))
-  out_dir <- file.path(CLEAN_UID_DIR, paste0(spec$tag, "_per_uid"))
-  done <- list.files(out_dir, pattern = sprintf("_dynamic_indices_%s\\.csv$", spec$tag), full.names = TRUE)
-  final <- data.table::rbindlist(lapply(done, function(f)
-    data.table::fread(f, colClasses = list(character = "uid"))))
-  final[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  data.table::fwrite(final, final_path)
-  cat(sprintf("Saved dynamic_indices_%s.csv: %d rows, %d PTs\n",
-              spec$tag, nrow(final), data.table::uniqueN(final$uid)))
-  invisible(final)
-}
-
-# ==============================================================================
-# SLEEP  — NOT windowed. One record per night, joined to each assessment by date.
-#   total_sleep + rem_sleep (minutes), deduped per night, night-before of the
-#   assessment date. No sliding windows / coverage / entropy apply here.
-#   Fast & single file per uid, so no parallelism needed.
-# ==============================================================================
-NIGHT_OFFSET_DAYS <- 0L   # calendarDate assumed = wake date; set 1 if onset date
-.val_rank <- function(v) ifelse(grepl("ENHANCED", v), 2L, 1L) * 10L +
-  ifelse(grepl("FINAL", v), 2L, 1L)
-
-run_sleep <- function(folder = "sleep", force = FALSE) {
-  final_path <- file.path(CLEAN_SENSOR_DIR, "dynamic_indices_sleep.csv")
-  if (file.exists(final_path) && !force) {
-    cat("dynamic_indices_sleep.csv already exists — skipping sleep processing\n")
-    return(invisible(data.table::fread(final_path, colClasses = list(character = "uid"))))
-  }
-  if (force && file.exists(final_path)) {
-    cat("force=TRUE — recalculating sleep and replacing dynamic_indices_sleep.csv\n")
-    unlink(final_path)
-  }
-  sdir <- file.path(RAW_DATA_DIR, folder)
-  files <- list.files(sdir, pattern = "\\.csv$", full.names = TRUE)
-  cat(sprintf("sleep: %d files\n", length(files)))
-  ema_for_sleep <- build_ema_lookup()
-  if (!"uid" %in% names(ema_for_sleep)) {
-    stop("EMA lookup for sleep is missing uid; rebuild ema_features.csv before run_sleep().")
-  }
-  ema_dates <- unique(ema_for_sleep[, .(uid, ema_day, date_rep, ema_time)])
-  ad <- suppressWarnings(as.Date(as.character(ema_dates$date_rep)))            # ISO
-  if (all(is.na(ad))) ad <- as.Date(as.character(ema_dates$date_rep), format = "%m/%d/%Y")
-  ema_dates[, assess_date := ad]
-  
-  out_list <- vector("list", length(files))
-  for (i in seq_along(files)) {
-    fp <- files[i]
-    uid_this <- stringr::str_pad(as.character(uid_default(fp)), width = 4, pad = "0")
-    s <- tryCatch(data.table::fread(fp), error = function(e) NULL)
-    need <- c("calendarDate","durationInSeconds","remSleepInSeconds","startTimeInSeconds","validation")
-    if (is.null(s) || !all(need %in% names(s))) next
-    s[, .vr := .val_rank(validation)]
-    data.table::setorder(s, calendarDate, -.vr, -durationInSeconds, -startTimeInSeconds)
-    s <- s[!duplicated(calendarDate)]                                          # 1 record/night
-    sl <- data.table::data.table(
-      uid = uid_this, sleep_date = as.Date(s$calendarDate),
-      total_sleep = as.numeric(s$durationInSeconds) / 60,
-      rem_sleep   = as.numeric(s$remSleepInSeconds) / 60)
-    sl <- sl[!is.na(total_sleep) & total_sleep >= 60 & total_sleep <= 14*60 & rem_sleep <= total_sleep]
-    em <- ema_dates[uid == uid_this]; if (!nrow(em)) next
-    em[, match_date := assess_date - NIGHT_OFFSET_DAYS]
-    out_list[[i]] <- merge(em, sl, by.x = "match_date", by.y = "sleep_date",
-                           all.x = TRUE, suffixes = c("", "_sleep"))[
-                             , .(uid, ema_day, date_rep, ema_time, total_sleep, rem_sleep)]
-  }
-  final <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
-  data.table::fwrite(final, final_path)
-  cat(sprintf("Saved dynamic_indices_sleep.csv: %d rows, %d PTs | %.0f%% nights matched\n",
-              nrow(final), data.table::uniqueN(final$uid),
-              100 * mean(!is.na(final$total_sleep))))
-  invisible(final)
-}
-
-# ==============================================================================
-# SENSOR SPECS
-#   acc is processed in the accelerometer block above because it uses a separate
-#   per-uid cache directory. Sleep is processed by run_sleep() because it is a
-#   night-before join rather than a rolling-window sensor.
-# ==============================================================================
-SENSORS <- list(
-  hr      = list(tag = "hr",      folder = "hr",      read = read_hr,      uid_fn = uid_default, epoch_sec = 10),
-  steps   = list(tag = "steps",   folder = "steps",   read = read_steps,   uid_fn = uid_default, epoch_sec = 30),
-  battery = list(tag = "battery", folder = "battery", read = read_battery, uid_fn = uid_default, epoch_sec = 3600),
-  convo   = list(tag = "convo",   folder = "convo",        read = read_convo,   uid_fn = uid_convo,   epoch_sec = NA_real_),
-  gps      = list(tag = "gps",      folder = "raw_gps_clean", read = read_gps,      uid_fn = uid_default, epoch_sec = 1800),
-  gps_home = list(tag = "gps_home", folder = "raw_gps_clean", read = read_gps_home, uid_fn = uid_default, epoch_sec = 1800),
-  sms      = list(tag = "sms",      folder = c("smslog.csv", "smslog", "sms.csv", "sms"),
-                  read = read_sms, uid_fn = uid_default, epoch_sec = NA_real_, combined_file = TRUE),
-  calls    = list(tag = "calls",    folder = c("calllog.csv", "calllog", "calls.csv", "calls"),
-                  read = read_calls, uid_fn = uid_default, epoch_sec = NA_real_, combined_file = TRUE)
-)
 
 # ------------------------------------------------------------------------------
-# ON SOURCE: test ONE participant for each sensor (verify readers, no scaling)
+# 5. RUN ONE CONFIGURATION
 # ------------------------------------------------------------------------------
-for (nm in names(SENSORS)) {
-  tryCatch(test_one(SENSORS[[nm]], "0011"),
-           error = function(e) cat(sprintf("TEST ERROR %s: %s\n", nm, conditionMessage(e))))
-}
-
-cat("\n--- to scale a sensor up once it looks right: ---\n")
-cat("# acc is processed by the accelerometer block above\n")
-cat("# run_full(SENSORS$hr)      # ~minutes; hr files are far smaller than acc\n")
-cat("# run_full(SENSORS$steps)\n# run_full(SENSORS$battery)\n")
-cat("# run_full(SENSORS$convo)\n# run_full(SENSORS$sms)\n# run_full(SENSORS$calls)\n")
-cat("# run_sleep()               # sleep is separate (night-before join, not windowed)\n")
-################################################################################
-
-run_full(SENSORS$hr)        # biggest after acc (~610k rows/uid) — a few min
-run_full(SENSORS$steps)
-run_full(SENSORS$battery)
-run_full(SENSORS$convo)
-run_full(SENSORS$gps)
-run_full(SENSORS$gps_home)
-run_full(SENSORS$sms, force = FALSE)
-run_full(SENSORS$calls, force = FALSE)
-run_sleep()
-
-reshape_dynamic_indices <- function(path, tag) {
-  d <- data.table::fread(path, colClasses = list(character = "uid"))
-  d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  key_cols <- c("uid", "date_rep", "ema_time")
-  if (!all(key_cols %in% names(d))) {
-    warning(sprintf("%s is missing merge keys; skipping", basename(path)))
-    return(NULL)
-  }
+run_config <- function(data_model, outcome, config,
+                       mtry_grid = c(2, 5, 10), ntree_grid = 500,
+                       n_cores = N_CORES) {
   
-  if (tag == "sleep") {
-    out <- d[, .(
-      total_sleep = mean(total_sleep, na.rm = TRUE),
-      rem_sleep = mean(rem_sleep, na.rm = TRUE)
-    ), by = key_cols]
-    out[, date_for_sleep := parse_date_any(date_rep)]
-    data.table::setorder(out, uid, date_for_sleep, ema_time)
-    out[, sleep_mad_total_sleep_day7 := {
-      vapply(seq_len(.N), function(i) {
-        x <- total_sleep[date_for_sleep < date_for_sleep[i] &
-                           date_for_sleep >= date_for_sleep[i] - 7]
-        mad_thr(x)
-      }, numeric(1))
-    }, by = uid]
-    out[, sleep_mad_rem_sleep_day7 := {
-      vapply(seq_len(.N), function(i) {
-        x <- rem_sleep[date_for_sleep < date_for_sleep[i] &
-                         date_for_sleep >= date_for_sleep[i] - 7]
-        mad_thr(x)
-      }, numeric(1))
-    }, by = uid]
-    for (w in names(WINDOWS)) {
-      if ("total_sleep" %in% names(out)) out[[paste0("sleep_mean_total_sleep_", w)]] <- out$total_sleep
-      if ("rem_sleep" %in% names(out)) out[[paste0("sleep_mean_rem_sleep_", w)]] <- out$rem_sleep
-    }
-    out[, intersect(c("total_sleep", "rem_sleep", "date_for_sleep"), names(out)) := NULL]
-    cat(sprintf("Sleep reshape columns: %s\n",
-                paste(grep("^sleep_", names(out), value = TRUE), collapse = ", ")))
-    return(unique(out, by = key_cols))
-  }
+  candidates <- make_candidates(config)
+  uids <- unique(data_model$uid)
+  n_cores <- max(1, min(n_cores, parallel::detectCores() - 1, length(uids)))
   
-  if (!"window" %in% names(d)) {
-    warning(sprintf("%s is missing window; skipping", basename(path)))
-    return(NULL)
-  }
-  measures <- intersect(c("coverage", "n_obs", "mean_val", "sum_val",
-                          "mad_val", "p90p10", "entropy"), names(d))
-  if (!length(measures)) return(NULL)
-  d[, (measures) := lapply(.SD, as.numeric), .SDcols = measures]
-  long <- data.table::melt(
-    d,
-    id.vars = c(key_cols, "window"),
-    measure.vars = measures,
-    variable.name = "measure",
-    value.name = "value"
-  )
-  long[, feature := paste(tag, window, measure, sep = "_")]
-  data.table::dcast(long, uid + date_rep + ema_time ~ feature,
-                    value.var = "value", fun.aggregate = mean, na.rm = TRUE)
-}
-
-assemble_feature_matrix_local <- function(outfile = "all_features_combined.csv") {
-  base <- data.table::fread(file.path(CLEAN_DATA_DIR, "ema_features.csv"), colClasses = list(character = "uid"))
-  base[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  key_cols <- c("uid", "date_rep", "ema_time")
-  if (!all(key_cols %in% names(base))) {
-    stop("ema_features.csv must contain uid, date_rep, and ema_time.")
-  }
+  cl <- parallel::makeCluster(n_cores)
+  doParallel::registerDoParallel(cl)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
   
-  tags <- c("acc", "hr", "steps", "battery", "convo", "gps", "gps_home", "sleep", "sms", "calls")
-  for (tag in tags) {
-    fp <- file.path(CLEAN_SENSOR_DIR, sprintf("dynamic_indices_%s.csv", tag))
-    if (!file.exists(fp)) {
-      cat(sprintf("Missing dynamic_indices_%s.csv — skipping %s columns\n", tag, tag))
-      next
-    }
-    wide <- reshape_dynamic_indices(fp, tag)
-    if (is.null(wide)) next
-    add_cols <- setdiff(setdiff(names(wide), key_cols), names(base))
-    if (length(add_cols)) {
-      base <- merge(base, wide[, c(key_cols, add_cols), with = FALSE],
-                    by = key_cols, all.x = TRUE, sort = FALSE)
-      cat(sprintf("Merged %s: %d columns\n", tag, length(add_cols)))
-    } else {
-      cat(sprintf("%s columns already present or empty\n", tag))
-    }
-  }
-  data.table::fwrite(base, file.path(CLEAN_DATA_DIR, outfile))
-  cat(sprintf("Saved %s: %d rows x %d cols (%d participants)\n",
-              outfile, nrow(base), ncol(base), data.table::uniqueN(base$uid)))
-  invisible(base)
-}
-
-assemble_feature_matrix_local()
-
-verify_sleep_mad_features <- function(path = file.path(CLEAN_DATA_DIR, "all_features_combined.csv")) {
-  d <- data.table::fread(path, nrows = 1)
-  cols <- grep("^sleep_mad_", names(d), value = TRUE)
-  if (!length(cols)) {
-    warning("No sleep_mad_ columns found. Re-run the data-cleaning section, then run assemble_feature_matrix_local().")
-  } else {
-    cat(sprintf("Found sleep MAD columns: %s\n", paste(cols, collapse = ", ")))
-  }
-  invisible(cols)
-}
-
-validate_feature_matrix <- function(path = file.path(CLEAN_DATA_DIR, "all_features_combined.csv")) {
-  d <- data.table::fread(path, nrows = 1)
-  core_prefixes <- c("acc_", "hr_", "steps_", "battery_", "convo_", "gps_",
-                     "gps_home_", "sleep_")
-  optional_prefixes <- c("sms_", "calls_")
-  core_present <- vapply(core_prefixes, function(p) any(grepl(paste0("^", p), names(d))), logical(1))
-  optional_present <- vapply(optional_prefixes, function(p) any(grepl(paste0("^", p), names(d))), logical(1))
-  if (any(!core_present)) {
-    warning(sprintf("Feature matrix is missing expected core prefixes: %s",
-                    paste(core_prefixes[!core_present], collapse = ", ")))
-  }
-  if (any(!optional_present)) {
-    message(sprintf("Optional event-log prefixes not present: %s",
-                    paste(optional_prefixes[!optional_present], collapse = ", ")))
-  }
-  invisible(c(core_present, optional_present))
-}
-
-validate_feature_matrix()
-
-dat <- read.csv(file.path(CLEAN_DATA_DIR, "all_features_combined.csv"))
-
-dynamic_sensor_days <- function(sensor) {
-  fp <- file.path(CLEAN_SENSOR_DIR, sprintf("dynamic_indices_%s.csv", sensor))
-  if (!file.exists(fp)) {
-    return(data.table::data.table(uid = character(), sensor = sensor, date = as.Date(character())))
-  }
-  cols <- names(data.table::fread(fp, nrows = 0))
-  select_cols <- intersect(c("uid", "date_rep", "n_obs", "total_sleep", "rem_sleep"), cols)
-  d <- data.table::fread(fp, select = select_cols, colClasses = list(character = "uid"))
-  if (!all(c("uid", "date_rep") %in% names(d))) {
-    return(data.table::data.table(uid = character(), sensor = sensor, date = as.Date(character())))
-  }
-  d[, uid := normalize_uid(uid)]
-  d[, date := parse_date_any(date_rep)]
-  if ("n_obs" %in% names(d)) {
-    d[, n_obs := suppressWarnings(as.numeric(n_obs))]
-    d <- d[!is.na(n_obs) & n_obs > 0]
-  } else if (sensor == "sleep") {
-    d <- d[(!is.na(total_sleep)) | (!is.na(rem_sleep))]
-  }
-  d <- unique(d[!is.na(uid) & !is.na(date), .(uid, date)])
-  if (!nrow(d)) return(data.table::data.table(uid = character(), sensor = sensor, date = as.Date(character())))
-  d[, sensor := sensor]
-  d[, .(uid, sensor, date)]
-}
-
-read_sensor_day_file <- function(sensor, fp) {
-  tryCatch({
-    if (sensor == "sleep") {
-      d <- data.table::fread(fp, select = c("calendarDate", "durationInSeconds",
-                                            "remSleepInSeconds", "validation"))
-      if (!"calendarDate" %in% names(d)) return(NULL)
-      d[, uid := normalize_uid(uid_default(fp))]
-      d[, date := parse_date_any(calendarDate)]
-      d <- d[!is.na(date)]
-      if ("durationInSeconds" %in% names(d)) {
-        d[, durationInSeconds := suppressWarnings(as.numeric(durationInSeconds))]
-        d <- d[!is.na(durationInSeconds) & durationInSeconds >= 60 * 60 &
-                 durationInSeconds <= 14 * 60 * 60]
-      }
-      return(unique(d[, .(uid, date)]))
-    }
-    uid_this <- if (sensor == "acc") normalize_uid(uid_default(fp)) else normalize_uid(SENSORS[[sensor]]$uid_fn(fp))
-    d <- if (sensor == "acc") read_acc(fp) else SENSORS[[sensor]]$read(fp)
-    if (is.null(d) || !nrow(d) || !"day" %in% names(d)) return(NULL)
-    data.table::data.table(uid = uid_this, date = as.Date(d$day))
-  }, error = function(e) NULL)
-}
-
-raw_sensor_days <- function(sensor, workers = 10) {
-  if (sensor == "sleep") {
-    sdir <- file.path(RAW_DATA_DIR, "sleep")
-    files <- list.files(sdir, pattern = "\\.csv$", full.names = TRUE)
-  } else if (sensor == "acc") {
-    files <- list.files(file.path(RAW_DATA_DIR, "acceleration"), pattern = "\\.csv$", full.names = TRUE)
-  } else if (!is.null(SENSORS[[sensor]])) {
-    files <- list_sensor_files(SENSORS[[sensor]])
-  } else {
-    files <- character(0)
-  }
-  if (!length(files)) {
-    return(data.table::data.table(uid = character(), sensor = sensor, date = as.Date(character())))
-  }
+  cat(sprintf("\n=== %s === (%d participants | %d candidate feature sets | %d cores)\n",
+              config, length(uids), length(candidates), n_cores))
   
-  data.table::setDTthreads(1)
-  cores <- max(1L, min(workers, parallel::detectCores() - 1L, length(files)))
-  rows <- if (requireNamespace("pbmcapply", quietly = TRUE) && cores > 1L) {
-    pbmcapply::pbmclapply(files, read_sensor_day_file, sensor = sensor,
-                          mc.cores = cores, mc.preschedule = FALSE)
-  } else if (cores > 1L) {
-    parallel::mclapply(files, read_sensor_day_file, sensor = sensor,
-                       mc.cores = cores, mc.preschedule = FALSE)
-  } else {
-    lapply(files, read_sensor_day_file, sensor = sensor)
-  }
-  data.table::setDTthreads(0)
-  out <- data.table::rbindlist(rows, use.names = TRUE, fill = TRUE)
-  if (!nrow(out)) return(data.table::data.table(uid = character(), sensor = sensor, date = as.Date(character())))
-  out <- out[!is.na(uid) & !is.na(date)]
-  out[, sensor := sensor]
-  unique(out[, .(uid, sensor, date)])
-}
-
-compute_raw_passive_compliance <- function(expected_days,
-                                           passive_sensors = c("acc","steps","hr","battery","gps","gps_home"),
-                                           force = FALSE,
-                                           method = c("dynamic_n_obs", "raw_files"),
-                                           workers = 10,
-                                           outfile = file.path(results_dir,
-                                                               "raw_passive_compliance_by_uid_sensor.csv")) {
-  method <- match.arg(method)
-  if (file.exists(outfile) && !force) {
-    return(data.table::fread(outfile, colClasses = list(character = "uid")))
-  }
-  make_dirs(dirname(outfile))
-  expected_days[, uid := normalize_uid(uid)]
-  expected_days <- unique(expected_days[!is.na(uid) & !is.na(date), .(uid, date)])
-  uid_expected <- expected_days[, .(expected_days = data.table::uniqueN(date)), by = uid]
-  valid_days <- data.table::rbindlist(lapply(passive_sensors, function(s) {
-    cat(sprintf("Computing passive compliance days: %s (%s)\n", s, method))
-    if (method == "dynamic_n_obs") dynamic_sensor_days(s) else raw_sensor_days(s, workers = workers)
-  }), use.names = TRUE, fill = TRUE)
-  valid_days <- unique(valid_days[uid %in% uid_expected$uid & !is.na(date), .(uid, sensor, date)])
-  valid_counts <- valid_days[, .(valid_days = data.table::uniqueN(date)), by = .(uid, sensor)]
-  
-  grid <- data.table::CJ(uid = uid_expected$uid, sensor = passive_sensors, unique = TRUE)
-  grid <- uid_expected[grid, on = "uid"]
-  grid <- valid_counts[grid, on = c("uid", "sensor")]
-  grid[is.na(valid_days), valid_days := 0L]
-  grid[, passive_compliance := valid_days / expected_days]
-  data.table::fwrite(grid, outfile)
-  grid[]
-}
-
-################################################################################
-# ANALYTIC INCLUSION + FEATURE-DROP CRITERIA  (Methods 2.4.1 / 2.4.3)
-#
-# Applied to all_features_combined.csv -> all_features_included.csv
-#
-# Drop criteria implemented:
-#   1. DROP stress entirely (sparse, unreliable).
-#   2. PARTICIPANT passive sensing data filter: mean data availability across
-#      passive streams, averaged equally across streams. SMS and calls are
-#      excluded from this threshold because they are sparse event logs.
-#      Default = 0.75, aligned with the Methods section.
-#   3. DROP feature columns whose values are ALL NA (e.g. indices never estimable
-#      — like event-based coverage, or sensors with no data).
-#   4. (optional) SI-count criterion: keep PTs with >= 10 SI-positive and
-#      >= 20 SI-negative q9 observations (Methods 2.4.1; Peduzzi/Riley).
-#
-################################################################################
-suppressPackageStartupMessages({ library(data.table); library(stringr) })
-
-apply_inclusion_criteria <- function(
-    infile             = "all_features_combined.csv",
-    outfile            = "all_features_included.csv",
-    ema_compliance_threshold = 0.75,
-    passive_data_threshold = 0.75,
-    passive_sensors    = c("acc","steps","hr","battery","gps","gps_home"),
-    drop_sensors       = c("stress"),          # dropped entirely
-    apply_ema_compliance = TRUE,
-    apply_passive_compliance = TRUE,
-    passive_compliance_method = c("dynamic_n_obs", "raw_files"),
-    passive_compliance_workers = WORKERS,
-    force_recompute_passive_compliance = FALSE,
-    apply_si_counts    = TRUE, min_si_pos = 10, min_si_neg = 20) {
-  passive_compliance_method <- match.arg(passive_compliance_method)
-  
-  input_path <- file.path(CLEAN_DATA_DIR, infile)
-  cat(sprintf("Reading inclusion input: %s\n", input_path))
-  d <- data.table::fread(input_path)
-  d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  n_uid0 <- data.table::uniqueN(d$uid); n_col0 <- ncol(d)
-  cat(sprintf("Input: %d rows, %d cols, %d participants\n", nrow(d), n_col0, n_uid0))
-  
-  ## 1. DROP stress (and any other listed sensors) entirely -------------------
-  for (s in drop_sensors) {
-    cols <- grep(sprintf("^%s_", s), names(d), value = TRUE)
-    if (length(cols)) { d[, (cols) := NULL]; cat(sprintf("Dropped %s: %d cols\n", s, length(cols))) }
-  }
-  
-  ## 2. EMA compliance from participant-level EMA completion rate --------------
-  keep_ema <- unique(d$uid)
-  ema_comp <- data.table::data.table(uid = unique(d$uid), ema_compliance = NA_real_)
-  if (apply_ema_compliance && "compliance" %in% names(d)) {
-    ema_comp <- d[, .(ema_compliance = max(suppressWarnings(as.numeric(compliance)), na.rm = TRUE)), by = uid]
-    ema_comp[!is.finite(ema_compliance), ema_compliance := NA_real_]
-    keep_ema <- ema_comp[!is.na(ema_compliance) & ema_compliance >= ema_compliance_threshold, uid]
-    cat(sprintf("EMA compliance >= %.0f%%: %d / %d participants kept (median compliance: %.2f)\n",
-                ema_compliance_threshold * 100, length(keep_ema), n_uid0,
-                stats::median(ema_comp$ema_compliance, na.rm = TRUE)))
-  }
-  
-  ## 3. Raw/minimally processed passive sensing compliance --------------------
-  expected_days <- unique(d[, .(uid, date = parse_date_any(date_rep))])
-  keep_cov <- unique(d$uid)
-  uid_cov <- data.table::data.table(uid = unique(d$uid), mean_cov = NA_real_)
-  uid_sensor <- data.table::data.table(uid = character(), sensor = character(),
-                                       expected_days = integer(), valid_days = integer(),
-                                       passive_compliance = numeric())
-  if (apply_passive_compliance) {
-    uid_sensor <- compute_raw_passive_compliance(
-      expected_days = expected_days,
-      passive_sensors = passive_sensors,
-      force = force_recompute_passive_compliance,
-      method = passive_compliance_method,
-      workers = passive_compliance_workers
-    )
-    uid_cov <- uid_sensor[, .(mean_cov = mean(passive_compliance, na.rm = TRUE)), by = uid]
-    keep_cov <- uid_cov[is.finite(mean_cov) & mean_cov >= passive_data_threshold, uid]
-    cat(sprintf("Raw passive sensing compliance >= %.0f%%: %d / %d participants kept (median compliance: %.2f)\n",
-                passive_data_threshold * 100, length(keep_cov), n_uid0,
-                stats::median(uid_cov$mean_cov, na.rm = TRUE)))
-  }
-  sensor_availability <- uid_sensor[, .(
-    n_participants = .N,
-    median_availability = stats::median(passive_compliance, na.rm = TRUE),
-    mean_availability = mean(passive_compliance, na.rm = TRUE),
-    n_below_75 = sum(passive_compliance < passive_data_threshold, na.rm = TRUE),
-    pct_below_75 = mean(passive_compliance < passive_data_threshold, na.rm = TRUE) * 100
-  ), by = sensor][order(-n_below_75, median_availability)]
-  cat("Raw passive sensor compliance summary (largest drop first):\n")
-  print(sensor_availability)
-  
-  ## 4. SI-count criterion (q9 raw 0-100; SI-positive = q9 > 0) ----------------
-  keep_si <- unique(d$uid)
-  if (apply_si_counts && "q9" %in% names(d)) {
-    si <- d[!is.na(q9), .(n_pos = sum(q9 > 0), n_neg = sum(q9 == 0)), by = uid]
-    keep_si <- si[n_pos >= min_si_pos & n_neg >= min_si_neg, uid]
-    cat(sprintf("SI counts (>=%d pos, >=%d neg): %d participants kept\n",
-                min_si_pos, min_si_neg, length(keep_si)))
-  }
-  
-  ## Participant-level inclusion breakdown ------------------------------------
-  all_uids <- sort(unique(d$uid))
-  si_counts <- if ("q9" %in% names(d)) {
-    d[!is.na(q9), .(n_si_pos = sum(q9 > 0), n_si_neg = sum(q9 == 0)), by = uid]
-  } else {
-    data.table::data.table(uid = all_uids, n_si_pos = NA_integer_, n_si_neg = NA_integer_)
-  }
-  inclusion_report <- data.table::data.table(uid = all_uids)[
-    uid_cov, on = "uid"
-  ][
-    ema_comp, on = "uid"
-  ][
-    si_counts, on = "uid"
-  ]
-  inclusion_report[, pass_ema := uid %in% keep_ema]
-  inclusion_report[, pass_passive := uid %in% keep_cov]
-  inclusion_report[, pass_si := uid %in% keep_si]
-  inclusion_report[, fail_si_positive := !is.na(n_si_pos) & n_si_pos < min_si_pos]
-  inclusion_report[, fail_si_negative := !is.na(n_si_neg) & n_si_neg < min_si_neg]
-  inclusion_report[, si_failure_reason := data.table::fcase(
-    pass_si, "pass_si_count",
-    fail_si_positive & fail_si_negative, "fail_both_si_positive_and_non_si",
-    fail_si_positive, "fail_si_positive_observations",
-    fail_si_negative, "fail_non_si_observations",
-    default = "unknown_or_missing_q9"
-  )]
-  inclusion_report[, inclusion_group := data.table::fcase(
-    pass_ema & pass_passive & pass_si, "pass_all",
-    !pass_ema & pass_passive & pass_si, "fail_ema_only",
-    pass_ema & !pass_passive & pass_si, "fail_passive_only",
-    pass_ema & pass_passive & !pass_si, "fail_si_only",
-    default = "pass_neither"
-  )]
-  breakdown <- inclusion_report[, .N, by = inclusion_group][order(inclusion_group)]
-  cat("Inclusion overlap breakdown:\n")
-  print(breakdown)
-  si_keystone <- inclusion_report[pass_ema & pass_passive, .(
-    denominator_passed_ema_passive = .N,
-    retained_after_si_count = sum(pass_si, na.rm = TRUE),
-    excluded_by_si_count = sum(!pass_si, na.rm = TRUE),
-    excluded_due_to_low_si_positive = sum(!pass_si & fail_si_positive, na.rm = TRUE),
-    excluded_due_to_low_si_positive_only = sum(!pass_si & fail_si_positive & !fail_si_negative, na.rm = TRUE),
-    excluded_due_to_low_non_si_only = sum(!pass_si & !fail_si_positive & fail_si_negative, na.rm = TRUE),
-    excluded_due_to_both_low_si_and_low_non_si = sum(!pass_si & fail_si_positive & fail_si_negative, na.rm = TRUE)
-  )]
-  si_reason_breakdown <- inclusion_report[pass_ema & pass_passive & !pass_si,
-                                          .N, by = si_failure_reason][order(-N)]
-  cat("\nKEYSTONE SI-count exclusion summary among participants who passed EMA + passive criteria:\n")
-  print(si_keystone)
-  cat("SI-count failure reason breakdown:\n")
-  print(si_reason_breakdown)
-  si_keystone_path <- file.path(results_dir, "keystone_si_count_exclusion_summary.csv")
-  data.table::fwrite(si_keystone, si_keystone_path)
-  si_reason_path <- file.path(results_dir, "keystone_si_count_failure_reasons.csv")
-  data.table::fwrite(si_reason_breakdown, si_reason_path)
-  cat(sprintf("Saved keystone SI-count summary: %s\n", si_keystone_path))
-  cat(sprintf("Saved keystone SI-count reason breakdown: %s\n", si_reason_path))
-  report_path <- file.path(results_dir, "inclusion_participant_report.csv")
-  make_dirs(dirname(report_path))
-  data.table::fwrite(inclusion_report, report_path)
-  cat(sprintf("Saved inclusion participant report: %s\n", report_path))
-  sensor_report_path <- file.path(results_dir, "passive_sensor_availability_report.csv")
-  data.table::fwrite(sensor_availability, sensor_report_path)
-  cat(sprintf("Saved passive sensor availability report: %s\n", sensor_report_path))
-  
-  ## intersect all participant criteria ---------------------------------------
-  keep <- Reduce(intersect, list(keep_ema, keep_cov, keep_si))
-  d <- d[uid %in% keep]
-  cat(sprintf("==> %d participants retained after all criteria\n", length(keep)))
-  
-  ## 5. DROP all-NA feature columns (computed AFTER row filtering) -------------
-  id_cols  <- intersect(c("uid","ema_day","date_rep","ema_time"), names(d))
-  feat_cols <- setdiff(names(d), id_cols)
-  all_na <- feat_cols[vapply(feat_cols, function(c) all(is.na(d[[c]])), logical(1))]
-  if (length(all_na)) {
-    d[, (all_na) := NULL]
-    cat(sprintf("Dropped %d all-NA feature columns\n", length(all_na)))
-  }
-  
-  data.table::fwrite(d, file.path(CLEAN_DATA_DIR, outfile))
-  cat(sprintf("\nSaved %s: %d rows x %d cols (%d participants)\n",
-              outfile, nrow(d), ncol(d), data.table::uniqueN(d$uid)))
-  invisible(list(data = d, kept_uids = keep, coverage = uid_cov,
-                 sensor_coverage = uid_sensor,
-                 sensor_availability = sensor_availability,
-                 dropped_cols = all_na))
-}
-
-res <- apply_inclusion_criteria(
-  outfile = "all_features_included.csv"
-)
-
-make_sensor_quality_distributions <- function(
-    infile = "all_features_combined.csv",
-    out_dir = results_dir,
-    tag = tools::file_path_sans_ext(basename(infile))) {
-  
-  if (!requireNamespace("ggplot2", quietly = TRUE)) {
-    warning("ggplot2 is not installed; skipping sensor quality distribution plots.")
-    return(invisible(NULL))
-  }
-  if (!requireNamespace("scales", quietly = TRUE)) {
-    warning("scales is not installed; skipping sensor quality distribution plots.")
-    return(invisible(NULL))
-  }
-  make_dirs(out_dir)
-  
-  d <- data.table::fread(file.path(CLEAN_DATA_DIR, infile), colClasses = list(character = "uid"))
-  d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  sensor_labels <- c(
-    acc = "Accelerometer", hr = "Heart rate", steps = "Steps",
-    battery = "Battery", convo = "Conversation", gps = "GPS / location",
-    gps_home = "Time at home", sleep = "Sleep", sms = "SMS", calls = "Calls"
-  )
-  sensor_tags <- names(sensor_labels)
-  
-  sensor_cols <- function(sensor, pattern) {
-    grep(sprintf("^%s_.*%s", sensor, pattern), names(d), value = TRUE)
-  }
-  
-  value_long <- data.table::rbindlist(lapply(sensor_tags, function(sensor) {
-    cols <- if (sensor == "sleep") {
-      grep("^sleep_mean_", names(d), value = TRUE)
-    } else {
-      sensor_cols(sensor, "_mean_val$")
-    }
-    if (!length(cols)) return(NULL)
-    d[, (cols) := lapply(.SD, as.numeric), .SDcols = cols]
-    x <- data.table::melt(
-      d[, c("uid", cols), with = FALSE],
-      id.vars = "uid",
-      variable.name = "feature",
-      value.name = "value"
-    )
-    x[, sensor := sensor_labels[[sensor]]]
-    x
-  }), use.names = TRUE, fill = TRUE)
-  
-  availability_long <- data.table::rbindlist(lapply(sensor_tags, function(sensor) {
-    cov_cols <- sensor_cols(sensor, "_coverage$")
-    mean_cols <- if (sensor == "sleep") grep("^sleep_mean_", names(d), value = TRUE) else sensor_cols(sensor, "_mean_val$")
-    if (length(cov_cols)) {
-      data.table::data.table(
-        uid = d$uid,
-        sensor = sensor_labels[[sensor]],
-        availability = rowMeans(as.matrix(d[, ..cov_cols]), na.rm = TRUE)
-      )
-    } else if (length(mean_cols)) {
-      data.table::data.table(
-        uid = d$uid,
-        sensor = sensor_labels[[sensor]],
-        availability = rowMeans(!is.na(as.data.frame(d[, ..mean_cols])))
-      )
-    } else {
-      NULL
-    }
-  }), use.names = TRUE, fill = TRUE)
-  
-  summary_rows <- data.table::rbindlist(lapply(sensor_tags, function(sensor) {
-    mean_cols <- if (sensor == "sleep") grep("^sleep_mean_", names(d), value = TRUE) else sensor_cols(sensor, "_mean_val$")
-    cov_cols <- sensor_cols(sensor, "_coverage$")
-    data.table::data.table(
-      sensor = sensor_labels[[sensor]],
-      n_features = length(mean_cols),
-      n_coverage_features = length(cov_cols),
-      pct_rows_any_value = if (length(mean_cols)) {
-        mean(rowSums(!is.na(as.data.frame(d[, ..mean_cols]))) > 0) * 100
-      } else NA_real_,
-      median_availability = if (length(cov_cols)) {
-        median(rowMeans(as.matrix(d[, ..cov_cols]), na.rm = TRUE), na.rm = TRUE)
-      } else if (length(mean_cols)) {
-        median(rowMeans(!is.na(as.data.frame(d[, ..mean_cols]))), na.rm = TRUE)
-      } else NA_real_
-    )
-  }), use.names = TRUE)
-  data.table::fwrite(summary_rows, file.path(out_dir, sprintf("sensor_quality_summary_%s.csv", tag)))
-  
-  if (nrow(value_long)) {
-    value_long <- value_long[is.finite(value)]
-    if (nrow(value_long)) {
-      p_values <- ggplot2::ggplot(value_long, ggplot2::aes(x = value)) +
-        ggplot2::geom_histogram(bins = 40, fill = "#7fb5a3", color = "white") +
-        ggplot2::facet_wrap(~ sensor, scales = "free", ncol = 2) +
-        ggplot2::labs(
-          title = "Sensor feature value distributions",
-          subtitle = sprintf("%s | mean-level features across EMA rows", infile),
-          x = "Feature value",
-          y = "Rows"
-        ) +
-        ggplot2::theme_minimal(base_size = 10) +
-        ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-      ggplot2::ggsave(file.path(out_dir, sprintf("sensor_value_distributions_%s.png", tag)),
-                      p_values, width = 12, height = 14, dpi = 200, bg = "white")
-    }
-  }
-  
-  if (nrow(availability_long)) {
-    availability_long <- availability_long[is.finite(availability)]
-    p_avail <- ggplot2::ggplot(availability_long, ggplot2::aes(x = availability)) +
-      ggplot2::geom_histogram(bins = 30, fill = "#5c7a8a", color = "white") +
-      ggplot2::facet_wrap(~ sensor, scales = "free_y", ncol = 2) +
-      ggplot2::scale_x_continuous(labels = scales::label_percent()) +
-      ggplot2::labs(
-        title = "Sensor data availability distributions",
-        subtitle = sprintf("%s | coverage when available, otherwise non-missing feature proportion", infile),
-        x = "Availability",
-        y = "Rows"
-      ) +
-      ggplot2::theme_minimal(base_size = 10) +
-      ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-    ggplot2::ggsave(file.path(out_dir, sprintf("sensor_availability_distributions_%s.png", tag)),
-                    p_avail, width = 12, height = 14, dpi = 200, bg = "white")
-  }
-  
-  cat(sprintf("Saved sensor QA plots and summary to: %s\n", out_dir))
-  invisible(list(values = value_long, availability = availability_long, summary = summary_rows))
-}
-
-make_sensor_quality_distributions("all_features_combined.csv", tag = "combined")
-if (file.exists(file.path(CLEAN_DATA_DIR, "all_features_included.csv"))) {
-  make_sensor_quality_distributions("all_features_included.csv", tag = "included")
-}
-
-make_dynamic_index_quality_distributions <- function(
-    infile = "all_features_included.csv",
-    out_dir = results_dir,
-    tag = tools::file_path_sans_ext(basename(infile))) {
-  
-  if (!requireNamespace("ggplot2", quietly = TRUE)) {
-    warning("ggplot2 is not installed; skipping dynamic-index QA plots.")
-    return(invisible(NULL))
-  }
-  if (!requireNamespace("scales", quietly = TRUE)) {
-    warning("scales is not installed; skipping dynamic-index QA plots.")
-    return(invisible(NULL))
-  }
-  make_dirs(out_dir)
-  d <- data.table::fread(file.path(CLEAN_DATA_DIR, infile), colClasses = list(character = "uid"))
-  d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  
-  passive_tags <- c("gps_home", "battery", "steps", "convo", "calls", "sleep",
-                    "acc", "gps", "sms", "hr")
-  feature_meta <- function(cols) {
-    rows <- lapply(cols, function(col) {
-      sensor <- passive_tags[vapply(passive_tags, function(s) {
-        grepl(paste0("^", s, "_"), col)
-      }, logical(1))][1]
-      if (is.na(sensor)) return(NULL)
-      rest <- sub(paste0("^", sensor, "_"), "", col)
-      parts <- strsplit(rest, "_", fixed = TRUE)[[1]]
-      if (sensor == "sleep") {
-        idx <- "mean"
-        win <- parts[length(parts)]
-      } else {
-        win <- parts[1]
-        idx <- paste(parts[-1], collapse = "_")
-      }
-      idx <- sub("_val$", "", idx)
-      data.table::data.table(feature = col, sensor = sensor, window = win, index = idx)
-    })
-    data.table::rbindlist(rows, use.names = TRUE, fill = TRUE)
-  }
-  
-  dynamic_cols <- grep("^(acc|hr|steps|battery|convo|gps|gps_home|sleep|sms|calls)_",
-                       names(d), value = TRUE)
-  dynamic_cols <- dynamic_cols[!grepl("_(coverage|n_obs)$", dynamic_cols)]
-  meta <- feature_meta(dynamic_cols)
-  if (!nrow(meta)) {
-    warning(sprintf("No dynamic-index feature columns found in %s", infile))
-    return(invisible(NULL))
-  }
-  
-  d[, (meta$feature) := lapply(.SD, as.numeric), .SDcols = meta$feature]
-  long <- data.table::melt(
-    d[, c("uid", meta$feature), with = FALSE],
-    id.vars = "uid",
-    variable.name = "feature",
-    value.name = "value"
-  )
-  long <- meta[long, on = "feature"]
-  
-  summary <- long[, .(
-    n_rows = .N,
-    n_participants = data.table::uniqueN(uid),
-    pct_missing = mean(is.na(value)) * 100,
-    pct_observed = mean(!is.na(value)) * 100,
-    median = stats::median(value, na.rm = TRUE),
-    iqr = stats::IQR(value, na.rm = TRUE),
-    p01 = stats::quantile(value, 0.01, na.rm = TRUE, names = FALSE),
-    p99 = stats::quantile(value, 0.99, na.rm = TRUE, names = FALSE)
-  ), by = .(sensor, index, window, feature)][order(-pct_missing, sensor, index, window)]
-  data.table::fwrite(summary, file.path(out_dir, sprintf("dynamic_index_quality_summary_%s.csv", tag)))
-  
-  missing_by_group <- summary[, .(
-    n_features = .N,
-    median_pct_missing = stats::median(pct_missing, na.rm = TRUE),
-    max_pct_missing = max(pct_missing, na.rm = TRUE)
-  ), by = .(sensor, index, window)][order(-median_pct_missing, sensor, index, window)]
-  data.table::fwrite(missing_by_group, file.path(out_dir, sprintf("dynamic_index_missingness_by_group_%s.csv", tag)))
-  
-  p_missing <- ggplot2::ggplot(missing_by_group,
-                               ggplot2::aes(x = window, y = median_pct_missing, fill = index)) +
-    ggplot2::geom_col(position = "dodge") +
-    ggplot2::facet_wrap(~ sensor, ncol = 2) +
-    ggplot2::scale_y_continuous(labels = scales::label_percent(scale = 1), limits = c(0, 100)) +
-    ggplot2::labs(
-      title = "Dynamic-index missingness by sensor, index, and window",
-      subtitle = infile,
-      x = "Window",
-      y = "Median missingness across features",
-      fill = "Index"
-    ) +
-    ggplot2::theme_minimal(base_size = 10) +
-    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-  ggplot2::ggsave(file.path(out_dir, sprintf("dynamic_index_missingness_%s.png", tag)),
-                  p_missing, width = 12, height = 14, dpi = 200, bg = "white")
-  
-  value_long <- long[!is.na(value) & is.finite(value)]
-  if (nrow(value_long)) {
-    p_values <- ggplot2::ggplot(value_long, ggplot2::aes(x = value)) +
-      ggplot2::geom_histogram(bins = 40, fill = "#7fb5a3", color = "white") +
-      ggplot2::facet_grid(sensor ~ index, scales = "free") +
-      ggplot2::labs(
-        title = "Dynamic-index value distributions",
-        subtitle = sprintf("%s | faceted by sensor and index", infile),
-        x = "Feature value",
-        y = "Rows"
-      ) +
-      ggplot2::theme_minimal(base_size = 9) +
-      ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-    ggplot2::ggsave(file.path(out_dir, sprintf("dynamic_index_value_distributions_%s.png", tag)),
-                    p_values, width = 16, height = 18, dpi = 200, bg = "white")
-  }
-  
-  cat(sprintf("Saved dynamic-index QA plots and summaries to: %s\n", out_dir))
-  invisible(list(long = long, summary = summary, missing_by_group = missing_by_group))
-}
-
-inspect_dynamic_index_merge <- function(
-    feature_file = "all_features_combined.csv",
-    out_dir = results_dir) {
-  
-  make_dirs(out_dir)
-  feature_path <- file.path(CLEAN_DATA_DIR, feature_file)
-  if (!file.exists(feature_path)) stop(sprintf("Missing feature file: %s", feature_path))
-  
-  fm <- data.table::fread(feature_path, nrows = 1)
-  combined_path <- file.path(CLEAN_DATA_DIR, "all_features_combined.csv")
-  combined_names <- if (file.exists(combined_path)) names(data.table::fread(combined_path, nrows = 1)) else character(0)
-  tags <- c("acc", "hr", "steps", "battery", "convo", "gps", "gps_home", "sleep", "sms", "calls")
-  tag_feature_count <- function(tag, nms) {
-    if (!length(nms)) return(NA_integer_)
-    pattern <- if (tag == "gps") "^gps_(?!home_)" else sprintf("^%s_", tag)
-    sum(grepl(pattern, nms, perl = TRUE))
-  }
-  expected <- data.table::rbindlist(lapply(tags, function(tag) {
-    fp <- file.path(CLEAN_SENSOR_DIR, sprintf("dynamic_indices_%s.csv", tag))
-    file_exists <- file.exists(fp)
-    n_rows <- NA_integer_
-    n_pts <- NA_integer_
-    source_cols <- 0L
+  res <- foreach::foreach(
+    h = seq_along(uids),
+    .packages = c("caret", "randomForest", "dplyr"),
+    .export = c("SlidingWindow_CV_prereg", "fit_preprocess", "usable_in",
+                "drop_near_zero_variance", "MIN_NONMISSING"),
+    .errorhandling = "pass"
+  ) %dopar% {
     
-    if (file_exists) {
-      src <- data.table::fread(fp, colClasses = list(character = "uid"))
-      n_rows <- nrow(src)
-      if ("uid" %in% names(src)) n_pts <- data.table::uniqueN(src$uid)
-      reshaped <- reshape_dynamic_indices(fp, tag)
-      if (!is.null(reshaped)) {
-        source_cols <- length(setdiff(names(reshaped), c("uid", "date_rep", "ema_time")))
-      }
-    }
+    uid <- uids[h]
+    pt  <- data_model[data_model$uid == uid, , drop = FALSE]
     
-    merged_cols <- tag_feature_count(tag, names(fm))
-    combined_cols <- tag_feature_count(tag, combined_names)
-    merge_status <- if (!file_exists) {
-      "missing_dynamic_file"
-    } else if (source_cols == 0L) {
-      "no_reshaped_columns"
-    } else if (merged_cols >= source_cols) {
-      "ok"
-    } else if (!identical(feature_file, "all_features_combined.csv") &&
-               !is.na(combined_cols) && combined_cols >= source_cols && merged_cols > 0L) {
-      "ok_after_filter_drop"
-    } else if (merged_cols > 0L) {
-      "partial"
-    } else {
-      "not_merged"
-    }
-    data.table::data.table(
-      sensor = tag,
-      dynamic_file_exists = file_exists,
-      dynamic_rows = n_rows,
-      dynamic_participants = n_pts,
-      expected_feature_columns = source_cols,
-      combined_feature_columns = combined_cols,
-      merged_feature_columns = merged_cols,
-      merge_status = merge_status
-    )
-  }), use.names = TRUE)
-  
-  out_csv <- file.path(out_dir, sprintf("dynamic_index_merge_inspection_%s.csv",
-                                        tools::file_path_sans_ext(basename(feature_file))))
-  data.table::fwrite(expected, out_csv)
-  print(expected)
-  if (any(!expected$merge_status %in% c("ok", "ok_after_filter_drop"))) {
-    warning(sprintf("Some dynamic index sources are missing or incomplete. See: %s", out_csv))
-  } else {
-    cat(sprintf("All dynamic index sources are represented in %s\n", feature_file))
-  }
-  invisible(expected)
-}
-
-inspect_dynamic_index_merge("all_features_combined.csv")
-if (file.exists(file.path(CLEAN_DATA_DIR, "all_features_included.csv"))) {
-  inspect_dynamic_index_merge("all_features_included.csv")
-}
-}
-
-if (RUN_MAIN_PIPELINE || RUN_FINAL_MANUSCRIPT_OUTPUTS ||
-    RUN_ALL_PT_CONTINUOUS_TIMESERIES || RUN_ALL_PT_HURDLE_TIMESERIES) {
-cat("\n===== SECTION: MAIN PREDICTION PIPELINE =====\n")
-################################################################################
-# SI Prediction Pipeline
-################################################################################
-# ==============================================================================
-# CONFIG
-# ==============================================================================
-BASE_PATH  <- resolve_project_base()
-cat(sprintf("Project base: %s\n", BASE_PATH))
-CODE_DIR   <- file.path(BASE_PATH, "1. Code")
-RAW_DATA_DIR <- file.path(BASE_PATH, "2. Raw data")
-CLEAN_DATA_DIR <- file.path(BASE_PATH, "3. Cleaned data")
-CLEAN_SENSOR_DIR <- file.path(CLEAN_DATA_DIR, "per_sensors")
-CLEAN_UID_DIR <- file.path(CLEAN_DATA_DIR, "per_uid")
-RESULTS_ROOT_DIR <- file.path(BASE_PATH, "4. Results")
-EMA_FILE   <- "3._TD_cohort_EMA_FINAL.csv"
-MODEL_FILE <- "all_features_included.csv"
-DEMO_FILE  <- "9._FinalDemographics.csv"
-N_CORES    <- set_default_flag("N_CORES", 12)
-NTREE      <- set_default_flag("NTREE", 700)
-MIN_FOLDS  <- set_default_flag("MIN_FOLDS", 10)
-REBUILD_EMA_FEATURES <- set_default_flag("REBUILD_EMA_FEATURES", FALSE)
-REBUILD_MODEL_CACHE <- set_default_flag("REBUILD_MODEL_CACHE", FALSE)
-RERUN_MODEL_RESULTS <- set_default_flag("RERUN_MODEL_RESULTS", FALSE)
-RERUN_F2_HURDLE <- set_default_flag("RERUN_F2_HURDLE", TRUE)
-RERUN_F2_REFERENCE_STYLE <- set_default_flag("RERUN_F2_REFERENCE_STYLE", FALSE)
-RUN_CONTINUOUS_MODELS <- set_default_flag("RUN_CONTINUOUS_MODELS", TRUE)
-RUN_HURDLE_MODELS <- set_default_flag("RUN_HURDLE_MODELS", TRUE)
-RERUN_COMPLETED_CONFIGS <- set_default_flag("RERUN_COMPLETED_CONFIGS", FALSE)
-RUN_MODEL_DIAGNOSTICS <- set_default_flag("RUN_MODEL_DIAGNOSTICS", FALSE)
-SENSOR_FOLDERS <- list(
-  acc="acceleration", hr="hr", steps="steps", convo="convo", gps="raw_gps_clean",
-  gps_home="raw_gps_clean", sms="sms", calls="calls", battery="battery",
-  sleep="sleep"
-)
-CV_VARIANTS <- list(
-  main  = list(train_days=45, val_days=10, test_days=1, ema_per_day=3)
-)
-results_dir       <- file.path(RESULTS_ROOT_DIR, "report")
-plots_dir         <- results_dir
-report_dir        <- results_dir
-report_all_pt_dir <- file.path(report_dir, "all_PT")
-report_all_pt_continuous_dir <- file.path(report_all_pt_dir, "continuous")
-report_all_pt_hurdle_dir <- file.path(report_all_pt_dir, "hurdle")
-model_config_cache_dir <- file.path(RESULTS_ROOT_DIR, "model_config_cache")
-ema_features_path <- file.path(CLEAN_DATA_DIR, "ema_features.csv")
-make_dirs(
-  CLEAN_DATA_DIR,
-  CLEAN_SENSOR_DIR,
-  CLEAN_UID_DIR,
-  results_dir,
-  plots_dir,
-  report_dir,
-  report_all_pt_dir,
-  report_all_pt_continuous_dir,
-  report_all_pt_hurdle_dir,
-  model_config_cache_dir
-)
-# ==============================================================================
-# SECTION 0: PACKAGES + SHARED HELPERS
-# ==============================================================================
-required_packages <- c(
-  "tidyverse", "data.table", "lubridate", "stringr", "tidyr",
-  "TSEntropies", "bit64", "parallel", "future.apply", "furrr", "progress",
-  "RANN", "geosphere", "caret", "randomForest", "foreach", "doParallel",
-  "effsize", "patchwork", "gbm", "pROC",
-  "ggplot2", "ggridges", "scales"
-)
-require_packages_or_stop(required_packages, "the main prediction pipeline")
-suppressPackageStartupMessages({
-  library(tidyverse); library(data.table); library(lubridate); library(stringr)
-  library(tidyr); library(TSEntropies); library(bit64); library(progress)
-  library(future.apply); library(furrr); library(RANN); library(geosphere)
-  library(caret); library(randomForest); library(foreach); library(doParallel)
-  library(effsize); library(patchwork); library(gbm); library(pROC)
-  library(ggplot2); library(ggridges); library(scales)
-})
-setwd(BASE_PATH)
-# Per-person min-max scaling
-minmax_scale <- function(x) {
-  mn <- min(x, na.rm = TRUE); mx <- max(x, na.rm = TRUE)
-  if (is.na(mn) || is.na(mx) || is.infinite(mn) || is.infinite(mx) || mx == mn) return(x)
-  (x - mn) / (mx - mn)
-}
-# Logger factory
-make_logger <- function(log_path) {
-  function(msg) {
-    out <- sprintf("[%s] %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg)
-    cat(out, "\n"); cat(out, "\n", file = log_path, append = TRUE)
-  }
-}
-# EMA lookup builder (used by run_sensor_pipeline)
-build_ema_lookup <- function(ema_path) {
-  read.csv(ema_path) %>%
-    filter(!is.na(ema_day)) %>%
-    mutate(uid        = str_extract(mlife_id, "^[^@]+"),
-           ema_day    = as.POSIXct(ema_day, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
-           anchor_end = ema_day - hours(4)) %>%
-    select(uid, ema_day, date_rep, ema_time, anchor_end) %>%
-    as.data.table() %>% { setkey(., uid); . }
-}
-# Cache short-circuit
-run_if_missing <- function(sensor_tag, run_fn) {
-  out_csv <- file.path(CLEAN_SENSOR_DIR, sprintf("dynamic_indices_%s.csv", sensor_tag))
-  if (file.exists(out_csv)) {
-    cat(sprintf("%-10s already done — skipping\n", sensor_tag)); return(invisible(NULL))
-  }
-  run_fn()
-}
-# within-fold per-feature min-max (learned on TRAIN rows only, applied to all splits)
-apply_minmax_fold <- function(ref_df, target_df, cols) {
-  for (cc in cols) {
-    if (!cc %in% names(ref_df) || !cc %in% names(target_df)) next
-    if (!is.numeric(ref_df[[cc]]) || !is.numeric(target_df[[cc]])) next
-    mn <- suppressWarnings(min(ref_df[[cc]], na.rm = TRUE))
-    mx <- suppressWarnings(max(ref_df[[cc]], na.rm = TRUE))
-    if (is.finite(mn) && is.finite(mx) && mx > mn)
-      target_df[[cc]] <- (target_df[[cc]] - mn) / (mx - mn)
-  }
-  target_df
-}
-candidate_predictors <- function(pt) {
-  meta <- c("uid", "day", outcome, "mlife_id", "ema_day", "ema_timestamp",
-            "date_rep", "ema_time")
-  feats <- setdiff(names(pt), meta)
-  feats <- feats[vapply(feats, function(f) is.numeric(pt[[f]]) && !all(is.na(pt[[f]])), logical(1))]
-  feats
-}
-# ------------------------------------------------------------------------------
-# run_sensor_pipeline — time-based windows + P90-P10 relative position
-# ------------------------------------------------------------------------------
-run_sensor_pipeline <- function(file_list, ema_lookup, sensor_tag,
-                                read_fn, signal_col, output_dir, log_fn,
-                                windows = list(hr1  = 3600,
-                                               hr4  = 14400,
-                                               day1 = 86400,
-                                               day7 = 604800)) {
-  make_dirs(output_dir)
-  pb <- progress::progress_bar$new(
-    format = "  [:bar] :current/:total | :uid | eta: :eta",
-    total = length(file_list), clear = FALSE, width = 90)
-  log_fn(sprintf("Pipeline start: %s", sensor_tag))
-  t0 <- proc.time()
-  
-  for (i in seq_along(file_list)) {
-    fp <- file_list[i]
-    uid_this <- str_extract(basename(fp), "^[^@]+")
-    out_path <- file.path(output_dir,
-                          sprintf("%s_dynamic_indices_%s.csv", uid_this, sensor_tag))
-    pb$tick(tokens = list(uid = uid_this))
-    if (file.exists(out_path)) {
-      log_fn(sprintf("SKIP %s — already done", uid_this)); next
-    }
+    if (var(pt[[outcome]], na.rm = TRUE) %in% c(0, NA))
+      return(list(preds = NULL, status = "zero_outcome_variance", uid = uid))
     
-    tryCatch({
-      dt <- read_fn(fp)
-      if (is.null(dt) || nrow(dt) == 0L) {
-        log_fn(sprintf("SKIP %s — empty", uid_this)); return(NULL)
+    slices <- SlidingWindow_CV_prereg(pt)
+    if (is.null(slices) || !length(slices$trains))
+      return(list(preds = NULL, status = "too_few_rows_for_CV", uid = uid))
+    
+    usable <- names(pt)[vapply(pt, function(z) is.numeric(z) && !all(is.na(z)), logical(1))]
+    fold_preds <- list()
+    
+    for (i in seq_along(slices$trains)) {
+      tr <- pt[slices$trains[[i]], , drop = FALSE]
+      vl <- pt[slices$vals[[i]],   , drop = FALSE]
+      te <- pt[slices$tests[[i]],  , drop = FALSE]
+      
+      # ---- Baseline: predict the training mean -------------------------------
+      if (config == "Baseline") {
+        m <- mean(tr[[outcome]], na.rm = TRUE)
+        if (is.na(m)) next
+        fold_preds[[length(fold_preds) + 1L]] <- data.frame(
+          fold = i, uid = uid, true = te[[outcome]], pred = m,
+          ema_window = NA_character_, window = NA_character_,
+          mtry = NA_integer_, ntree = NA_integer_, stringsAsFactors = FALSE)
+        next
       }
-      ema_this <- ema_lookup[uid == uid_this]
-      if (nrow(ema_this) == 0L) {
-        log_fn(sprintf("SKIP %s — no EMA", uid_this)); return(NULL)
-      }
       
-      max_t <- as.numeric(max(ema_this$anchor_end))
-      min_t <- as.numeric(min(ema_this$anchor_end)) - 604800
-      dt <- dt[as.numeric(day) >= min_t & as.numeric(day) <= max_t]
-      if (nrow(dt) == 0L) {
-        log_fn(sprintf("SKIP %s — no range", uid_this)); return(NULL)
-      }
+      best <- list(score = -Inf)
       
-      data.table::setkey(dt, day)
-      day_vec <- as.numeric(dt$day)
-      sig_vec <- dt[[signal_col]]
-      rm(dt); gc()
-      
-      n_ema <- nrow(ema_this)
-      results <- vector("list", n_ema * length(windows))
-      k <- 1L
-      
-      for (j in seq_len(n_ema)) {
-        ae <- as.numeric(ema_this$anchor_end[j])
+      for (cand in candidates) {
+        pv <- usable_in(intersect(cand$vars, usable), tr)
+        pv <- drop_near_zero_variance(pv, tr)
+        if (length(pv) < 2) next
         
-        # current_x = mean of obs in [ae - 1800, ae)
-        cur_lo <- findInterval(ae - 1800, day_vec)
-        cur_hi <- findInterval(ae,        day_vec)
-        x_cur_window <- if (cur_hi > cur_lo) sig_vec[(cur_lo + 1L):cur_hi] else numeric(0)
-        x_current <- mean_thr(x_cur_window)
+        pp <- fit_preprocess(tr, pv)
+        if (is.null(pp)) next
+        x_tr <- tryCatch(predict(pp, tr[, pv, drop = FALSE]), error = function(e) NULL)
+        x_vl <- tryCatch(predict(pp, vl[, pv, drop = FALSE]), error = function(e) NULL)
+        if (is.null(x_tr) || is.null(x_vl)) next
         
-        # Each window selected by TIME range
-        for (wn in names(windows)) {
-          win_sec <- windows[[wn]]
-          win_lo  <- findInterval(ae - win_sec, day_vec)
-          win_hi  <- findInterval(ae,           day_vec)
-          x <- if (win_hi > win_lo) sig_vec[(win_lo + 1L):win_hi] else numeric(0)
-          x_clean <- x[!is.na(x)]
-          
-          results[[k]] <- data.frame(
-            uid        = ema_this$uid[j],
-            ema_day    = ema_this$ema_day[j],
-            date_rep   = ema_this$date_rep[j],
-            ema_time   = ema_this$ema_time[j],
-            anchor_end = ema_this$anchor_end[j],
-            window     = wn,
-            n_obs      = length(x_clean),
-            mean_val   = mean_thr(x_clean),
-            mad_val    = mad_thr(x_clean),
-            p90p10     = p90p10_relpos(x_clean, x_current),
-            entropy    = sample_entropy(x_clean)
-          )
-          k <- k + 1L
+        d_tr <- cbind(x_tr, .y = tr[[outcome]])
+        names(d_tr)[ncol(d_tr)] <- outcome
+        
+        for (mt in mtry_grid) for (nt in ntree_grid) {
+          mt_use <- min(mt, ncol(x_tr))
+          if (mt_use < 1) next
+          fit <- tryCatch(randomForest::randomForest(
+            stats::as.formula(paste(outcome, "~ .")),
+            data = d_tr, mtry = mt_use, ntree = nt), error = function(e) NULL)
+          if (is.null(fit)) next
+          pv_hat <- tryCatch(predict(fit, newdata = x_vl), error = function(e) NULL)
+          if (is.null(pv_hat)) next
+          # validation score: lower MAE is better (scale-aware, unlike cor^2)
+          sc <- -mean(abs(pv_hat - vl[[outcome]]), na.rm = TRUE)
+          if (is.finite(sc) && sc > best$score)
+            best <- list(score = sc, vars = pv, ema_window = cand$ema_window,
+                         window = cand$window, mtry = mt, ntree = nt)
         }
-        if (j %% 20 == 0) gc()
       }
       
-      out <- data.table::rbindlist(results)
-      data.table::fwrite(out, out_path)
-      rm(day_vec, sig_vec, results, out); gc()
-      log_fn(sprintf("DONE %s — %d EMA rows", uid_this, n_ema))
-    }, error = function(e) log_fn(sprintf("ERROR %s: %s", uid_this, e$message)))
-  }
-  
-  log_fn(sprintf("Pipeline done: %s — %.1f min",
-                 sensor_tag, (proc.time() - t0)["elapsed"] / 60))
-  
-  done_files <- list.files(output_dir,
-                           pattern = sprintf("_dynamic_indices_%s\\.csv$", sensor_tag),
-                           full.names = TRUE)
-  final <- data.table::rbindlist(lapply(done_files, data.table::fread))
-  out_csv <- file.path(CLEAN_SENSOR_DIR, sprintf("dynamic_indices_%s.csv", sensor_tag))
-  data.table::fwrite(final, out_csv)
-  log_fn(sprintf("Saved: dynamic_indices_%s.csv (%d rows, %d participants)",
-                 sensor_tag, nrow(final), uniqueN(final$uid)))
-  invisible(final)
-}
-# ==============================================================================
-# SECTION 1: EMA PROCESSING
-# ==============================================================================
-if (file.exists(ema_features_path) && !REBUILD_EMA_FEATURES) {
-  cat(sprintf("\n===== EMA features cached — using %s =====\n", basename(ema_features_path)))
-} else {
-  cat("\n===== Rebuild EMA features =====\n")
-  # 1. Derive compliant_uids from existing sensor outputs (restored)
-  sensor_csvs <- list.files(CLEAN_SENSOR_DIR, pattern = "^dynamic_indices_.*\\.csv$", full.names = TRUE)
-  cat(sprintf("Found %d sensor CSVs\n", length(sensor_csvs)))
-  if (length(sensor_csvs) > 0) {
-    all_sensor_uids <- unique(unlist(lapply(sensor_csvs, function(fp) {
-      uids <- data.table::fread(fp, select = "uid", nThread = 2)$uid
-      as.character(uids)
-    })))
-    all_sensor_uids <- stringr::str_pad(all_sensor_uids, width = 4, pad = "0")
-    compliant_uids <- sort(unique(all_sensor_uids))
-  } else {
-    cat("WARNING: no sensor CSVs found yet — compliant_uids set from EMA file only.\n")
-    compliant_uids <- character(0)
-  }
-  cat(sprintf("Compliant UIDs from sensor data: %d\n", length(compliant_uids)))
-  write.csv(data.frame(uid = compliant_uids),
-            file.path(CLEAN_DATA_DIR, "compliant_uids.csv"), row.names = FALSE)
-  # 2. Load and clean EMA
-  ema_raw <- read.csv(file.path(RAW_DATA_DIR, EMA_FILE))
-  ema_selected <- ema_raw %>%
-    select(mlife_id, compliance, date_rep, ema_time, ema_timestamp,
-           starts_with("PHQ."), starts_with("GAD."), starts_with("RespTime_")) %>%
-    rename_with(~ str_replace(.x, "^PHQ\\.", "q"), starts_with("PHQ.")) %>%
-    rename_with(~ str_replace(.x, "^GAD\\.", "g"), starts_with("GAD.")) %>%
-    mutate(
-      ema_day = select(., starts_with("RespTime_")) %>%
-        apply(1, function(row) {
-          ts <- unlist(str_extract_all(as.character(row), "(?<=;)[0-9.]+"))
-          if (length(ts) == 0 || all(is.na(ts))) return(NA_real_)
-          max(as.numeric(ts), na.rm = TRUE)
-        }) %>% as.POSIXct(origin = "1970-01-01", tz = "UTC")
-    ) %>%
-    select(-starts_with("RespTime_")) %>%
-    filter(compliance >= 0.75)
-  ema_complete <- ema_selected %>%
-    filter(!is.na(date_rep), !is.na(ema_time)) %>%
-    mutate(date_rep = as.Date(date_rep, format = "%m/%d/%Y"),
-           ema_time = factor(ema_time, levels = c("morning","afternoon","evening"))) %>%
-    group_by(mlife_id) %>%
-    complete(date_rep = seq(min(date_rep, na.rm = TRUE),
-                            max(date_rep, na.rm = TRUE), by = "day"),
-             ema_time = c("morning","afternoon","evening")) %>%
-    filter(!(date_rep == min(date_rep) & ema_time < first(ema_time[!is.na(compliance)])),
-           !(date_rep == max(date_rep) & ema_time > last(ema_time[!is.na(compliance)]))) %>%
-    ungroup()
-  cat(sprintf("EMA rows: %d | Participants: %d\n",
-              nrow(ema_complete), uniqueN(ema_complete$mlife_id)))
-  # 3. Compute dynamic indices (uses Section 0 helpers: mean_thr, mad_thr, p90p10_relpos)
-  vars <- c(paste0("q", 1:9), "g1", "g2")
-  dt <- as.data.table(ema_complete)
-  dt[, ema_num    := as.numeric(ema_day)]
-  dt[, anchor_end := ema_num - 3600 * 4]
-  dt[, row_id     := .I]
-  setkey(dt, mlife_id, ema_num)
-  src <- dt[, c("row_id","mlife_id","ema_num", vars), with = FALSE]
-  setkey(src, mlife_id, ema_num)
-  n_rows <- nrow(dt)
-  d1_mat <- matrix(NA_real_, nrow = n_rows, ncol = length(vars),
-                   dimnames = list(NULL, paste0(vars, "_mean_d1")))
-  d7_mat <- matrix(NA_real_, nrow = n_rows, ncol = length(vars) * 2,
-                   dimnames = list(NULL, c(paste0(vars, "_mean_d7"),
-                                           paste0(vars, "_mad_d7"))))
-  pb_ema <- progress::progress_bar$new(
-    format = "  [:bar] :current/:total | :percent | eta: :eta",
-    total = n_rows, clear = FALSE, width = 80)
-  for (i in seq_len(n_rows)) {
-    pb_ema$tick()
-    uid_i <- dt$mlife_id[i]
-    ae    <- dt$anchor_end[i]
-    
-    # 1-day window: mean only
-    p1 <- src[mlife_id == uid_i & ema_num >= (ae - 86400) & ema_num < ae]
-    if (nrow(p1) > 0) {
-      d1_mat[i, ] <- sapply(vars, function(v) mean_thr(p1[[v]]))
+      if (!is.finite(best$score)) next
+      
+      # ---- refit on train+val, predict test ----------------------------------
+      tv <- dplyr::bind_rows(tr, vl)
+      bv <- usable_in(best$vars, tv)
+      bv <- drop_near_zero_variance(bv, tv)
+      if (length(bv) < 2) next
+      
+      pp2 <- fit_preprocess(tv, bv)
+      if (is.null(pp2)) next
+      x_tv <- tryCatch(predict(pp2, tv[, bv, drop = FALSE]), error = function(e) NULL)
+      x_te <- tryCatch(predict(pp2, te[, bv, drop = FALSE]), error = function(e) NULL)
+      if (is.null(x_tv) || is.null(x_te)) next
+      
+      d_tv <- cbind(x_tv, .y = tv[[outcome]])
+      names(d_tv)[ncol(d_tv)] <- outcome
+      
+      fit <- tryCatch(randomForest::randomForest(
+        stats::as.formula(paste(outcome, "~ .")), data = d_tv,
+        mtry = min(best$mtry, ncol(x_tv)), ntree = best$ntree), error = function(e) NULL)
+      if (is.null(fit)) next
+      p_te <- tryCatch(predict(fit, newdata = x_te), error = function(e) NULL)
+      if (is.null(p_te)) next
+      
+      fold_preds[[length(fold_preds) + 1L]] <- data.frame(
+        fold = i, uid = uid, true = te[[outcome]], pred = as.numeric(p_te),
+        ema_window = best$ema_window, window = best$window,
+        mtry = best$mtry, ntree = best$ntree, stringsAsFactors = FALSE)
     }
     
-    # 7-day window: mean + MAD (no P90-P10 for EMA)
-    p7 <- src[mlife_id == uid_i & ema_num >= (ae - 604800) & ema_num < ae]
-    if (nrow(p7) > 0) {
-      d7_mat[i, seq_along(vars)]                  <- sapply(vars, function(v) mean_thr(p7[[v]]))
-      d7_mat[i, seq_along(vars) + length(vars)]   <- sapply(vars, function(v) mad_thr(p7[[v]]))
-    }
+    if (!length(fold_preds))
+      return(list(preds = NULL, status = "no_fold_succeeded", uid = uid))
     
-    if (i %% 1000 == 0) gc()
+    list(preds = dplyr::bind_rows(fold_preds), status = "ok", uid = uid)
   }
-  dt <- cbind(dt, as.data.table(d1_mat), as.data.table(d7_mat))
-  dt[, c("ema_num","anchor_end","row_id") := NULL]
-  # 4. Filter to compliant uids (if any) and save
-  ema_features <- as.data.frame(dt) %>%
-    mutate(uid = stringr::str_pad(str_extract(mlife_id, "^[^@]+"), width = 4, pad = "0"))
-  if (length(compliant_uids) > 0) {
-    ema_features <- ema_features %>% filter(uid %in% compliant_uids)
+  
+  # ---- report why any participant was lost ------------------------------------
+  errored <- vapply(res, function(x) inherits(x, "error"), logical(1))
+  if (any(errored)) {
+    cat(sprintf("  %d participant(s) errored; first message: %s\n",
+                sum(errored), conditionMessage(res[errored][[1]])))
   }
-  data.table::fwrite(ema_features, ema_features_path)
-  cat(sprintf("Saved: ema_features.csv (%d rows | %d PTs)\n",
-              nrow(ema_features), uniqueN(ema_features$uid)))
-  summary(ema_features)
-}
-# ==============================================================================
-# SECTION 2: DIGITAL PHENOTYPE PROCESSING
-# ==============================================================================
-# Digital phenotype cleaning, EMA feature construction, passive dynamic-index
-# processing, and analytic inclusion criteria are implemented above in this same
-# single script. Stress is dropped because it was not retained for analysis.
-# Participants are retained if they meet EMA compliance, passive compliance
-# across continuously sampled streams (acc, steps, HR, battery, GPS distance,
-# GPS time at home), and SI-count criteria. The exact retained N is printed and
-# saved when apply_inclusion_criteria() is run.
-# ==============================================================================
-# SECTION 3: RANDOM FOREST PREDICTION
-# ==============================================================================
-# cor (Pearson r), r2 (coefficient of determination), mse, mae, rmse, auc.
-# Figures and R²>0 subsets use the TRUE r2 column (not sign(cor)*cor^2).
-# ==============================================================================
-cat("\n===== SECTION 3: Random Forest Prediction =====\n")
-set.seed(12361488)
-model_source_path <- file.path(CLEAN_DATA_DIR, MODEL_FILE)
-data_model_path <- file.path(
-  CLEAN_DATA_DIR,
-  sprintf("%s_filtered.csv", tools::file_path_sans_ext(basename(MODEL_FILE)))
-)
-cat(sprintf("Model source file: %s\n", basename(model_source_path)))
-cat(sprintf("Model cache file: %s\n", basename(data_model_path)))
-parse_date_rep <- function(x) {
-  raw <- as.character(x)
-  out <- suppressWarnings(as.Date(raw, format = "%Y-%m-%d"))
-  miss <- is.na(out)
-  out[miss] <- suppressWarnings(as.Date(raw[miss], format = "%m/%d/%Y"))
-  miss <- is.na(out)
-  out[miss] <- suppressWarnings(lubridate::ymd(raw[miss]))
-  miss <- is.na(out)
-  out[miss] <- suppressWarnings(lubridate::mdy(raw[miss]))
-  out
-}
-n_pt <- function(d) dplyr::n_distinct(d$uid[!is.na(d$uid)])
-log_model_step <- function(label, d) {
-  cat(sprintf("  %-38s %7d rows | %4d participants\n", label, nrow(d), n_pt(d)))
-}
-lag_previous_observed <- function(x) {
-  out <- rep(NA_real_, length(x))
-  last <- NA_real_
-  for (i in seq_along(x)) {
-    out[i] <- last
-    if (!is.na(x[i])) last <- x[i]
+  res <- res[!errored]
+  
+  status <- vapply(res, function(x) x$status, character(1))
+  if (any(status != "ok")) {
+    tab <- table(status[status != "ok"])
+    cat(sprintf("  dropped: %s\n",
+                paste(sprintf("%s=%d", names(tab), as.integer(tab)), collapse = ", ")))
   }
-  out
+  cat(sprintf("  retained %d / %d participants\n", sum(status == "ok"), length(uids)))
+  
+  ok <- Filter(function(x) identical(x$status, "ok"), res)
+  if (!length(ok)) return(NULL)
+  dplyr::bind_rows(lapply(ok, `[[`, "preds")) %>% mutate(Configuration = config)
 }
-model_cache_stale <- file.exists(data_model_path) &&
-  file.exists(model_source_path) &&
-  file.info(model_source_path)$mtime > file.info(data_model_path)$mtime
-if (REBUILD_MODEL_CACHE || model_cache_stale || !file.exists(data_model_path)) {
-  if (file.exists(data_model_path)) {
-    cat(sprintf("Rebuilding %s from %s\n", basename(data_model_path), basename(model_source_path)))
-  }
-  data_raw <- data.table::fread(model_source_path, colClasses = list(character = "uid")) %>%
-    as.data.frame()
-  log_model_step("input included feature matrix", data_raw)
-  
-  data_filtered <- data_raw %>%
-    mutate(uid = stringr::str_pad(as.character(uid), width = 4, pad = "0"),
-           date_rep = parse_date_rep(date_rep),
-           ema_time = factor(ema_time, levels = c("morning", "afternoon", "evening"))) %>%
-    filter(!is.na(date_rep))
-  log_model_step("after date parsing", data_filtered)
-  
-  data_filtered <- data_filtered %>%
-    group_by(uid) %>% filter(!all(is.na(date_rep))) %>%
-    complete(date_rep = seq(min(date_rep, na.rm = TRUE),
-                            max(date_rep, na.rm = TRUE), by = "day"),
-             ema_time = c("morning", "afternoon", "evening")) %>%
-    arrange(uid, date_rep, ema_time) %>% ungroup()
-  log_model_step("after complete daily EMA grid", data_filtered)
-  
-  # Lag all 11 EMA items by one prompt within each participant.
-  ema_items <- c("q1","q2","q3","q4","q5","q6","q7","q8","q9","g1","g2")
-  
-  data_after_burnin <- data_filtered %>%
-    group_by(uid) %>%
-    mutate(first_date = min(date_rep, na.rm = TRUE)) %>%
-    filter(date_rep >= first_date + 7) %>%
-    select(-first_date) %>%
-    ungroup()
-  log_model_step("after 7-day burn-in", data_after_burnin)
-  
-  data_after_lag <- data_after_burnin %>%
-    group_by(uid) %>%
-    arrange(date_rep, ema_time, .by_group = TRUE) %>%
-    mutate(across(all_of(ema_items), lag_previous_observed, .names = "{.col}_lag")) %>%
-    ungroup() %>%
-    # Forward-fill q3 and q3_lag from morning to afternoon/evening of same day
-    group_by(uid, date_rep) %>%
-    mutate(q3     = dplyr::first(q3[ema_time     == "morning"], default = NA_real_),
-           q3_lag = dplyr::first(q3_lag[ema_time == "morning"], default = NA_real_)) %>%
-    ungroup()
-  log_model_step("after EMA lag construction", data_after_lag)
-  
-  data_model_full <- data_after_lag %>%
-    filter(!is.na(q9))
-  log_model_step("after current q9 filter", data_model_full)
-  retention_report <- data_after_lag %>%
-    group_by(uid) %>%
+
+# ------------------------------------------------------------------------------
+# 6. METRICS  (TRUE R-squared, not squared correlation)
+#    AUC and balanced accuracy describe how well the CONTINUOUS prediction
+#    separates SI-positive from SI-negative moments. The Youden threshold is
+#    chosen on the same test predictions being scored, so both are optimistic.
+# ------------------------------------------------------------------------------
+participant_metrics <- function(preds) {
+  preds %>%
+    group_by(Configuration, uid) %>%
     summarise(
-      rows_after_lag = n(),
-      observed_q9 = sum(!is.na(q9)),
-      observed_q9_with_lag = sum(!is.na(q9) & !is.na(q9_lag)),
-      model_rows = sum(!is.na(q9)),
+      r = suppressWarnings(cor(pred, true, use = "complete.obs")),
+      R2 = {
+        ss_tot <- sum((true - mean(true, na.rm = TRUE))^2, na.rm = TRUE)
+        ss_res <- sum((true - pred)^2, na.rm = TRUE)
+        if (!is.finite(ss_tot) || ss_tot == 0) NA_real_ else 1 - ss_res / ss_tot
+      },
+      MAE  = mean(abs(pred - true), na.rm = TRUE),
+      RMSE = sqrt(mean((pred - true)^2, na.rm = TRUE)),
+      AUC = {
+        tb <- as.integer(true > 0)
+        if (length(unique(tb)) < 2) NA_real_
+        else suppressMessages(as.numeric(pROC::auc(pROC::roc(tb, pred, quiet = TRUE))))
+      },
+      BalancedAcc = {
+        tb <- as.integer(true > 0)
+        if (length(unique(tb)) < 2) NA_real_ else {
+          ro <- pROC::roc(tb, pred, quiet = TRUE)
+          b  <- pROC::coords(ro, "best", best.method = "youden",
+                             ret = c("sensitivity", "specificity"), transpose = FALSE)
+          (as.numeric(b$sensitivity[1]) + as.numeric(b$specificity[1])) / 2
+        }
+      },
+      n_obs   = dplyr::n(),
+      n_folds = dplyr::n_distinct(fold),
       .groups = "drop"
     )
-  retention_path <- file.path(results_dir, "model_filter_retention_by_uid.csv")
-  write.csv(retention_report, retention_path, row.names = FALSE)
-  cat(sprintf("Saved model retention report: %s\n", retention_path))
-  
-  data_model_full <- data_model_full %>%
-    rename(day = ema_time) %>%
-    select(-any_of(c("date_rep", "ema_time"))) %>%
-    # Outcome rescaling only (constant /100 -> no leakage). Per-feature min-max is
-    # applied WITHIN each training split inside the fit functions (apply_minmax_fold).
-    mutate(q9     = q9     / 100,
-           q9_lag = ifelse(is.na(q9_lag), NA_real_, q9_lag / 100)) %>%
-    ungroup()
-  
-  write.csv(data_model_full, data_model_path, row.names = FALSE)
-  cat(sprintf("Saved: %s (%d rows | %d participants)\n",
-              basename(data_model_path),
-              nrow(data_model_full), uniqueN(data_model_full$uid)))
 }
-data_model_base <- data.table::fread(data_model_path, colClasses = list(character = "uid")) %>%
-  as.data.frame()
-# Target = current q9 (PATCHED: was q9_lag)
-outcome <- "q9"
-# Sliding-window CV factory (unchanged)
-make_sliding_cv <- function(train_days, val_days, test_days, ema_per_day = 3) {
-  function(data) {
-    n <- nrow(data)
-    train_n <- train_days * ema_per_day
-    val_n   <- val_days   * ema_per_day
-    test_n  <- test_days  * ema_per_day
-    slide_n <- test_n
-    if (n < train_n + val_n + test_n) return(NULL)
-    trains <- list(); vals <- list(); tests <- list(); k <- 1L; start <- 1L
-    while ((start + train_n + val_n + test_n - 1) <= n) {
-      trains[[k]] <- start:(start + train_n - 1)
-      vals[[k]]   <- (start + train_n):(start + train_n + val_n - 1)
-      tests[[k]]  <- (start + train_n + val_n):(start + train_n + val_n + test_n - 1)
-      k <- k + 1L; start <- start + slide_n
-    }
-    if (length(trains) == 0) return(NULL)
-    list(trains = trains, vals = vals, tests = tests)
+
+fmt_iqr <- function(x, digits = 3, plus = FALSE) {
+  x <- x[is.finite(x)]
+  if (!length(x)) return("")
+  q <- stats::quantile(x, c(.25, .5, .75), na.rm = TRUE)
+  f <- function(v) {
+    s <- sprintf(paste0("%.", digits, "f"), v)
+    if (plus && v > 0) paste0("+", s) else s
   }
+  sprintf("%s [%s, %s]", f(q[2]), f(q[1]), f(q[3]))
 }
-summarize_si_non_si_counts <- function(data, variant_name = "main") {
-  cv_params <- CV_VARIANTS[[variant_name]]
-  cv_fn <- make_sliding_cv(cv_params$train_days, cv_params$val_days,
-                           cv_params$test_days, cv_params$ema_per_day)
-  test_y <- unlist(lapply(split(data, data$uid), function(pt) {
-    sl <- cv_fn(pt)
-    if (is.null(sl) || !length(sl$tests)) return(numeric(0))
-    pt[[outcome]][unlist(sl$tests)]
-  }))
-  out <- data.frame(
-    variant = variant_name,
-    analytic_participants = dplyr::n_distinct(data$uid),
-    analytic_rows = nrow(data),
-    analytic_SI_obs = sum(data[[outcome]] > 0, na.rm = TRUE),
-    analytic_nonSI_obs = sum(data[[outcome]] == 0, na.rm = TRUE),
-    test_SI_obs = sum(test_y > 0, na.rm = TRUE),
-    test_nonSI_obs = sum(test_y == 0, na.rm = TRUE),
-    test_total_obs = length(test_y),
-    stringsAsFactors = FALSE
-  )
-  out_path <- file.path(results_dir, sprintf("si_non_si_counts_%s.csv", variant_name))
-  write.csv(out, out_path, row.names = FALSE)
-  cat(sprintf(
-    "\nSI/non-SI counts [%s]: analytic SI=%s, analytic non-SI=%s | test SI=%s, test non-SI=%s\n",
-    variant_name,
-    format(out$analytic_SI_obs, big.mark = ","),
-    format(out$analytic_nonSI_obs, big.mark = ","),
-    format(out$test_SI_obs, big.mark = ","),
-    format(out$test_nonSI_obs, big.mark = ",")
-  ))
-  cat(sprintf("Saved SI/non-SI count summary: %s\n", out_path))
-  invisible(out)
+
+make_table <- function(metrics) {
+  metrics %>%
+    group_by(Configuration) %>%
+    summarise(
+      n                             = sum(!is.na(r)),
+      `r, median [IQR]`             = fmt_iqr(r, 3, plus = TRUE),
+      `% r>0`                       = sprintf("%.0f%%", 100 * mean(r > 0, na.rm = TRUE)),
+      `R2, median [IQR]`            = fmt_iqr(R2, 3, plus = TRUE),
+      `MAE, median [IQR]`           = fmt_iqr(MAE, 4),
+      `RMSE, median [IQR]`          = fmt_iqr(RMSE, 4),
+      `AUC, median [IQR]`           = fmt_iqr(AUC, 3),
+      `Balanced acc., median [IQR]` = fmt_iqr(BalancedAcc, 3),
+      .groups = "drop"
+    ) %>%
+    mutate(Configuration = factor(Configuration, levels = CONFIGS)) %>%
+    arrange(Configuration)
 }
-si_non_si_counts_main <- summarize_si_non_si_counts(data_model_base, "main")
-get_passive_mean_cols <- function(sensor, window, data) {
-  if (sensor == "sleep") grep(sprintf("^sleep_mean_.*_%s$", window),    names(data), value = TRUE)
-  else                   grep(sprintf("^%s_%s_(mean_val|sum_val)$", sensor, window), names(data), value = TRUE)
-}
-get_passive_dynamic_cols <- function(sensor, window, data) {
-  if (sensor == "sleep") grep(sprintf("^sleep_mad_.*_%s$", window),                   names(data), value = TRUE)
-  else                   grep(sprintf("^%s_%s_(mad_val|p90p10|entropy)$", sensor, window), names(data), value = TRUE)
-}
-# All 11 EMA predictors are LAGGED (PATCHED).
-ema_mean <- c("q1_lag","q2_lag","q3_lag","q4_lag","q5_lag",
-              "q6_lag","q7_lag","q8_lag","q9_lag","g1_lag","g2_lag")
-# Window features are unchanged (already pre-anchor)
-ema_dyn  <- grep("^(q|g)[0-9]+_(mean_d|mad_d|p90p10_d)", names(data_model_base), value = TRUE)
-sensors  <- c("acc","hr","steps","convo","gps","gps_home","sms","calls","battery","sleep")
-pmean    <- function(w, d) unlist(lapply(sensors, get_passive_mean_cols,    window = w, data = d))
-pdyn     <- function(w, d) unlist(lapply(sensors, get_passive_dynamic_cols, window = w, data = d))
-configs <- list(
-  EMA_mean                     = function(w, d) ema_mean,
-  EMA_mean_dynamic             = function(w, d) c(ema_mean, ema_dyn),
-  Opt_Passive_mean             = function(w, d) pmean(w, d),
-  Opt_Passive_mean_dynamic     = function(w, d) c(pmean(w, d), pdyn(w, d)),
-  EMA_Opt_Passive_mean         = function(w, d) c(ema_mean, pmean(w, d)),
-  EMA_Opt_Passive_mean_dynamic = function(w, d) c(ema_mean, ema_dyn, pmean(w, d), pdyn(w, d))
-)
-MODEL_CONFIGS <- names(configs)  # The six feature-set models; baseline is a benchmark, not counted as a model.
-WINDOWS    <- c("hr1","hr4","day1","day7")
-MTRY_GRID  <- c(2, 5, 10)
-NTREE_GRID <- c(200, 500)
-GBM_CLS    <- data.frame(n.trees=100, interaction.depth=3, shrinkage=0.1, n.minobsinnode=10)
-GBM_REG    <- data.frame(n.trees=100, interaction.depth=3, shrinkage=0.1, n.minobsinnode=5)
-is_passive_feature <- function(x) {
-  grepl("^(acc|hr|steps|convo|gps_home|gps|sms|calls|battery|sleep)_", x)
-}
-drop_near_zero_variance_features <- function(cols, training_data,
-                                             freqCut = 19,
-                                             uniqueCut = 10) {
-  cols <- intersect(cols, names(training_data))
-  if (length(cols) < 1) return(cols)
-  numeric_cols <- cols[vapply(cols, function(cc) is.numeric(training_data[[cc]]), logical(1))]
-  non_numeric_cols <- setdiff(cols, numeric_cols)
-  if (length(numeric_cols) < 1) return(cols)
-  nzv <- tryCatch(
-    caret::nearZeroVar(training_data[, numeric_cols, drop = FALSE],
-                       freqCut = freqCut, uniqueCut = uniqueCut),
-    error = function(e) integer(0)
-  )
-  if (length(nzv)) numeric_cols <- numeric_cols[-nzv]
-  unique(c(non_numeric_cols, numeric_cols))
-}
+
 # ------------------------------------------------------------------------------
-reg_metrics <- function(pred, true) {
-  ok   <- !is.na(pred) & !is.na(true)
-  pred <- pred[ok]; true <- true[ok]
-  n <- length(true)
-  if (n < 1) return(list(cor=NA_real_, r2=NA_real_, mse=NA_real_,
-                         mae=NA_real_, rmse=NA_real_))
-  resid  <- pred - true
-  mse    <- mean(resid^2)
-  mae    <- mean(abs(resid))
-  rmse   <- sqrt(mse)
-  cor_v  <- if (n >= 2) suppressWarnings(stats::cor(pred, true)) else NA_real_
-  ss_tot <- sum((true - mean(true))^2)
-  r2     <- if (ss_tot > 0) 1 - sum(resid^2) / ss_tot else NA_real_
-  list(cor=cor_v, r2=r2, mse=mse, mae=mae, rmse=rmse)
+# 7. RUN ALL CONFIGURATIONS
+# ------------------------------------------------------------------------------
+all_preds <- list()
+for (cfg in CONFIGS) {
+  t0 <- Sys.time()
+  all_preds[[cfg]] <- run_config(dat, OUTCOME, cfg)
+  cat(sprintf("  done in %.1f min\n", as.numeric(difftime(Sys.time(), t0, units = "mins"))))
 }
-# [UPDATED] Row schema — carries r2, mse, mae alongside cor, rmse, auc.
-empty_row <- function(uid, status) data.frame(
-  Participant=stringr::str_pad(as.character(uid), width = 4, pad = "0"),
-  cor=NA_real_, r2=NA_real_, mse=NA_real_, mae=NA_real_,
-  rmse=NA_real_, auc=NA_real_, sensitivity=NA_real_, specificity=NA_real_,
-  balanced_acc=NA_real_, n_obs=0, n_SI=NA_integer_, n_nonSI=NA_integer_,
-  n_folds=0, status=status)
-ok_row <- function(uid, n_folds, n_obs,
-                   cor_v=NA, r2_v=NA, mse_v=NA, mae_v=NA, rmse_v=NA, auc_v=NA,
-                   sensitivity_v=NA, specificity_v=NA, balanced_acc_v=NA,
-                   n_SI_v=NA_integer_, n_nonSI_v=NA_integer_)
-  data.frame(
-    Participant=stringr::str_pad(as.character(uid), width = 4, pad = "0"),
-    cor=cor_v, r2=r2_v, mse=mse_v, mae=mae_v,
-    rmse=rmse_v, auc=auc_v, sensitivity=sensitivity_v, specificity=specificity_v,
-    balanced_acc=balanced_acc_v, n_obs=n_obs, n_SI=n_SI_v, n_nonSI=n_nonSI_v,
-    n_folds=n_folds, status="ok")
-binary_metrics <- function(true_bin, p_si, threshold = 0.5) {
-  ok <- !is.na(true_bin) & !is.na(p_si)
-  true_bin <- as.integer(true_bin[ok])
-  p_si <- p_si[ok]
-  threshold <- if (length(threshold) == 1L) {
-    rep(threshold, length(p_si))
+
+preds_all   <- dplyr::bind_rows(all_preds)
+metrics_all <- participant_metrics(preds_all)
+
+# (a) all participants with a result in each configuration
+table_all <- make_table(metrics_all)
+
+# (b) same participants across every configuration — the like-for-like comparison
+common_uids <- metrics_all %>% filter(!is.na(r)) %>%
+  count(uid) %>% filter(n == length(CONFIGS)) %>% pull(uid)
+table_common <- make_table(metrics_all %>% filter(uid %in% common_uids))
+
+cat(sprintf("\nCommon-sample N = %d\n", length(common_uids)))
+cat("\n--- Table: all available participants ---\n")
+print(as.data.frame(table_all))
+cat("\n--- Table: common participants across all configurations ---\n")
+print(as.data.frame(table_common))
+
+write.csv(table_all,    "Table_continuous_models_all.csv",    row.names = FALSE)
+write.csv(table_common, "Table_continuous_models_common.csv", row.names = FALSE)
+write.csv(metrics_all,  "model_comparison_participant_metrics.csv", row.names = FALSE)
+write.csv(preds_all,    "model_comparison_predictions.csv", row.names = FALSE)
+
+cat("\nSaved: Table_continuous_models_all.csv, Table_continuous_models_common.csv\n")
+
+
+################################################################################
+# NESTED CV MODEL COMPARISON — TWO-PART HURDLE (GBM), 7 configurations
+#
+# Stage 1 (occurrence): gradient-boosted classifier for any SI (q9 > 0)
+# Stage 2 (severity)  : gradient-boosted regression on SI-positive rows only
+# Combined prediction : P(SI) x E[severity | SI], clamped to the q9 range
+#
+#   Baseline                  (training P(SI) x training mean non-zero severity)
+#   EMA                       (EMA mean features)
+#   EMA (dynamic)             (EMA mean + MAD features)
+#   Passive                   (all passive sensors pooled, mean features)
+#   Passive (dynamic)         (all passive sensors pooled, mean + dynamic)
+#   EMA + Passive             (EMA mean + pooled passive mean)
+#   EMA + Passive (dynamic)   (all of the above)
+#
+# The classification threshold is selected by Youden's J on the VALIDATION
+# split of each fold and then applied unchanged to the test day, so sensitivity,
+# specificity and balanced accuracy are not optimised on the data they score.
+#
+# Input : all_features_cleaned.csv
+# Output: Table_hurdle_models_all.csv, Table_hurdle_models_common.csv,
+#         hurdle_participant_metrics.csv, hurdle_predictions.csv
+################################################################################
+
+library(dplyr)
+library(stringr)
+library(tibble)
+library(caret)
+library(gbm)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(data.table)
+library(pROC)
+
+# ------------------------------------------------------------------------------
+# 1. LOAD DATA
+# ------------------------------------------------------------------------------
+setwd("/Users/ahhyun/Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction/3. Cleaned data")
+
+OUTCOME    <- "q9"
+N_CORES    <- 10
+OUTCOME_MAX <- 100    # q9 is on the 0-100 scale in all_features_cleaned.csv
+
+dat <- data.table::fread("all_features_cleaned.csv",
+                         colClasses = list(character = "uid")) %>%
+  as.data.frame()
+
+dat <- dat %>%
+  mutate(.ord = match(ema_time, c("morning", "afternoon", "evening"))) %>%
+  arrange(uid, date_rep, .ord) %>%
+  select(-.ord) %>%
+  filter(!is.na(.data[[OUTCOME]]))
+
+cat(sprintf("Loaded %d rows | %d participants\n", nrow(dat), n_distinct(dat$uid)))
+
+# ------------------------------------------------------------------------------
+# 2. CLASSIFY FEATURE COLUMNS   (identical to the continuous script)
+# ------------------------------------------------------------------------------
+non_feature <- c("uid","date_rep","ema_time","mlife_id","compliance","ema_timestamp",
+                 "ema_day","q9","q1","q2","q3","q4","q5","q6","q7","q8","g1","g2")
+
+all_cols <- setdiff(colnames(dat), non_feature)
+all_cols <- all_cols[!grepl("(_coverage|_n_obs)$", all_cols)]
+
+EMA_WINDOWED_PATTERN   <- "^(q[1-9]|g[12])_(mean|mad)_d(1|7)$"
+SLEEP_PATTERN          <- "^sleep_(mean|mad)_(total_sleep|rem_sleep)_(day1|day7)$"
+PASSIVE_WINDOW_PATTERN <- "(hr1|hr4|day1|day7)"
+
+col_class <- tibble(col = all_cols) %>%
+  mutate(
+    is_ema_windowed = str_detect(col, regex(EMA_WINDOWED_PATTERN, ignore_case = TRUE)),
+    is_sleep        = str_detect(col, regex(SLEEP_PATTERN, ignore_case = TRUE)),
+    is_passive      = str_detect(col, regex(PASSIVE_WINDOW_PATTERN, ignore_case = TRUE)) &
+      !is_ema_windowed & !is_sleep,
+    source = case_when(is_ema_windowed ~ "ema",
+                       is_sleep        ~ "passive",
+                       is_passive      ~ "passive",
+                       TRUE            ~ "unclassified"),
+    type = case_when(
+      is_ema_windowed & str_detect(col, "_mean_d[17]$") ~ "mean",
+      is_ema_windowed & str_detect(col, "_mad_d[17]$")  ~ "dynamic",
+      is_sleep   & str_detect(col, "^sleep_mean_") ~ "mean",
+      is_sleep   & str_detect(col, "^sleep_mad_")  ~ "dynamic",
+      is_passive & str_detect(col, regex("(_mean_val|_sum_val)$", ignore_case = TRUE)) ~ "mean",
+      is_passive & str_detect(col, regex("(_mad_val|_entropy|_p90p10)$", ignore_case = TRUE)) ~ "dynamic",
+      TRUE ~ NA_character_),
+    window = case_when(
+      is_ema_windowed ~ str_replace(str_extract(col, "d[17]$"), "^d", "day"),
+      is_sleep        ~ str_extract(col, "(day1|day7)$"),
+      is_passive      ~ str_extract(col, regex(PASSIVE_WINDOW_PATTERN, ignore_case = TRUE)),
+      TRUE ~ NA_character_),
+    sensor = case_when(
+      is_sleep   ~ paste0("sleep_", str_extract(col, "(total_sleep|rem_sleep)")),
+      is_passive ~ str_remove(col, regex(paste0("_(", PASSIVE_WINDOW_PATTERN, ")_.*$"),
+                                         ignore_case = TRUE)),
+      TRUE ~ NA_character_)
+  ) %>%
+  filter(source != "unclassified", !is.na(type), !is.na(window))
+
+sensors_standard <- col_class %>% filter(source == "passive") %>% pull(sensor) %>% unique()
+windows_standard <- col_class %>% filter(source == "passive") %>% pull(window) %>% unique()
+windows_ema      <- col_class %>% filter(source == "ema")     %>% pull(window) %>% unique()
+
+cat(sprintf("Features classified: EMA windows [%s] | %d passive sensors x %d windows\n",
+            paste(windows_ema, collapse = ", "),
+            length(sensors_standard), length(windows_standard)))
+
+passive_cols_for <- function(window, include_dynamic) {
+  types <- if (include_dynamic) c("mean", "dynamic") else "mean"
+  col_class %>%
+    filter(source == "passive", window == !!window, type %in% types) %>% pull(col)
+}
+ema_cols_for <- function(window, include_dynamic) {
+  types <- if (include_dynamic) c("mean", "dynamic") else "mean"
+  col_class %>%
+    filter(source == "ema", window == !!window, type %in% types) %>% pull(col)
+}
+
+# ------------------------------------------------------------------------------
+# 3. CANDIDATE FEATURE SETS
+# ------------------------------------------------------------------------------
+make_candidates <- function(config) {
+  out <- list()
+  add <- function(vars, ema_window, window) {
+    vars <- unique(vars)
+    if (length(vars) >= 2)
+      out[[length(out) + 1L]] <<- list(vars = vars, ema_window = ema_window, window = window)
+  }
+  if (config == "Baseline") return(out)
+  
+  uses_ema     <- grepl("EMA", config, fixed = TRUE)
+  uses_passive <- grepl("Passive", config, fixed = TRUE)
+  dyn          <- grepl("dynamic", config, fixed = TRUE)
+  
+  if (uses_ema && !uses_passive) {
+    for (we in windows_ema) add(ema_cols_for(we, dyn), we, NA_character_)
+  } else if (!uses_ema && uses_passive) {
+    for (w in windows_standard) add(passive_cols_for(w, dyn), NA_character_, w)
   } else {
-    threshold[ok]
+    ema_block <- unlist(lapply(windows_ema, ema_cols_for, include_dynamic = dyn))
+    for (w in windows_standard)
+      add(c(ema_block, passive_cols_for(w, dyn)), "all", w)
   }
-  pred_bin <- as.integer(p_si >= threshold)
-  if (!length(true_bin) || length(unique(true_bin)) < 2) {
-    return(list(sensitivity=NA_real_, specificity=NA_real_, balanced_acc=NA_real_))
-  }
-  tp <- sum(pred_bin == 1 & true_bin == 1)
-  fn <- sum(pred_bin == 0 & true_bin == 1)
-  tn <- sum(pred_bin == 0 & true_bin == 0)
-  fp <- sum(pred_bin == 1 & true_bin == 0)
-  sens <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
-  spec <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
-  list(sensitivity=sens, specificity=spec, balanced_acc=mean(c(sens, spec), na.rm=TRUE))
+  out
 }
+
+CONFIGS <- c("Baseline", "EMA", "EMA (dynamic)", "Passive", "Passive (dynamic)",
+             "EMA + Passive", "EMA + Passive (dynamic)")
+
+# ------------------------------------------------------------------------------
+# 4. SLIDING-WINDOW CV + PER-FOLD PREPROCESSING (as in the continuous script)
+# ------------------------------------------------------------------------------
+SlidingWindow_CV_prereg <- function(data, train_days = 45, val_days = 10,
+                                    test_days = 1, ema_per_day = 3) {
+  n <- nrow(data)
+  train_n <- train_days * ema_per_day
+  val_n   <- val_days   * ema_per_day
+  test_n  <- test_days  * ema_per_day
+  if (n < train_n + val_n + test_n) return(NULL)
+  trains <- vals <- tests <- list(); k <- 1L; start <- 1L
+  while ((start + train_n + val_n + test_n - 1L) <= n) {
+    trains[[k]] <- start:(start + train_n - 1L)
+    vals[[k]]   <- (start + train_n):(start + train_n + val_n - 1L)
+    tests[[k]]  <- (start + train_n + val_n):(start + train_n + val_n + test_n - 1L)
+    k <- k + 1L; start <- start + test_n
+  }
+  if (!length(trains)) return(NULL)
+  list(trains = trains, vals = vals, tests = tests)
+}
+
+MIN_NONMISSING <- 0.50
+
+usable_in <- function(cols, train_df, min_nonmissing = MIN_NONMISSING) {
+  cols <- intersect(cols, names(train_df))
+  if (!length(cols)) return(character(0))
+  keep <- vapply(cols, function(cc) {
+    x <- train_df[[cc]]
+    is.numeric(x) && mean(!is.na(x)) >= min_nonmissing &&
+      sum(!is.na(x)) >= 2 && stats::var(x, na.rm = TRUE) > 0
+  }, logical(1))
+  cols[keep]
+}
+
+drop_near_zero_variance <- function(cols, train_df, freqCut = 19, uniqueCut = 10) {
+  cols <- intersect(cols, names(train_df))
+  if (length(cols) < 1) return(cols)
+  nzv <- tryCatch(caret::nearZeroVar(train_df[, cols, drop = FALSE],
+                                     freqCut = freqCut, uniqueCut = uniqueCut),
+                  error = function(e) integer(0))
+  if (length(nzv)) cols <- cols[-nzv]
+  cols
+}
+
+fit_preprocess <- function(train_df, cols) {
+  pp <- tryCatch(caret::preProcess(train_df[, cols, drop = FALSE],
+                                   method = c("zv", "knnImpute")),
+                 error = function(e) NULL)
+  if (is.null(pp))
+    pp <- tryCatch(caret::preProcess(train_df[, cols, drop = FALSE],
+                                     method = c("zv", "medianImpute")),
+                   error = function(e) NULL)
+  pp
+}
+
+# ------------------------------------------------------------------------------
+# 4b. HURDLE FITTING
+#     Fixed GBM hyperparameters (Methods 2.4.3); only the feature window is tuned.
+# ------------------------------------------------------------------------------
+GBM_CLS <- data.frame(n.trees = 100, interaction.depth = 3,
+                      shrinkage = 0.1, n.minobsinnode = 10)
+GBM_REG <- data.frame(n.trees = 100, interaction.depth = 3,
+                      shrinkage = 0.1, n.minobsinnode = 5)
+
+MIN_SI_TRAIN <- 10    # SI-positive training rows needed to fit the severity stage
+
+# Fit both stages on x_tr/y_tr, predict on x_eval.
+# Returns p_si (occurrence probability) and pred (combined expected severity).
+hurdle_fit <- function(x_tr, y_tr, x_eval, outcome_max = OUTCOME_MAX) {
+  bin <- factor(ifelse(y_tr > 0, "SI", "noSI"), levels = c("noSI", "SI"))
+  if (length(unique(bin)) < 2) return(NULL)
+  
+  d_cls <- cbind(x_tr, .bin = bin)
+  cls <- tryCatch(suppressWarnings(caret::train(
+    .bin ~ ., data = d_cls, method = "gbm",
+    trControl = caret::trainControl(method = "none", classProbs = TRUE),
+    tuneGrid = GBM_CLS, verbose = FALSE)), error = function(e) NULL)
+  if (is.null(cls)) return(NULL)
+  
+  p_si <- tryCatch(predict(cls, x_eval, type = "prob")[, "SI"], error = function(e) NULL)
+  if (is.null(p_si)) return(NULL)
+  
+  # severity stage: SI-positive training rows only
+  sev <- rep(0, nrow(x_eval))
+  pos <- which(y_tr > 0)
+  if (length(pos) >= MIN_SI_TRAIN && stats::var(y_tr[pos]) > 0) {
+    d_reg <- cbind(x_tr[pos, , drop = FALSE], y_target = y_tr[pos])
+    reg <- tryCatch(suppressWarnings(caret::train(
+      y_target ~ ., data = d_reg, method = "gbm",
+      trControl = caret::trainControl(method = "none"),
+      tuneGrid = GBM_REG, verbose = FALSE)), error = function(e) NULL)
+    if (!is.null(reg)) {
+      s <- tryCatch(predict(reg, x_eval), error = function(e) NULL)
+      if (!is.null(s)) sev <- as.numeric(s)
+    }
+  }
+  
+  list(p_si = as.numeric(p_si),
+       sev  = sev,
+       pred = pmax(0, pmin(outcome_max, as.numeric(p_si) * sev)))
+}
+
+# Youden's J threshold chosen on validation predictions.
 choose_youden_threshold <- function(true_bin, p_si,
                                     thresholds = seq(0.01, 0.99, by = 0.01)) {
   ok <- !is.na(true_bin) & !is.na(p_si)
-  true_bin <- as.integer(true_bin[ok])
-  p_si <- p_si[ok]
+  true_bin <- as.integer(true_bin[ok]); p_si <- p_si[ok]
   if (!length(true_bin) || length(unique(true_bin)) < 2) return(0.5)
-  scores <- vapply(thresholds, function(thr) {
-    bin <- binary_metrics(true_bin, p_si, threshold = thr)
-    bin$sensitivity + bin$specificity - 1
+  j <- vapply(thresholds, function(thr) {
+    pred <- as.integer(p_si >= thr)
+    tp <- sum(pred == 1 & true_bin == 1); fn <- sum(pred == 0 & true_bin == 1)
+    tn <- sum(pred == 0 & true_bin == 0); fp <- sum(pred == 1 & true_bin == 0)
+    sens <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
+    spec <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
+    sens + spec - 1
   }, numeric(1))
-  if (all(is.na(scores))) return(0.5)
-  best_thresholds <- thresholds[scores == max(scores, na.rm = TRUE)]
-  stats::median(best_thresholds, na.rm = TRUE)
+  if (all(is.na(j))) return(0.5)
+  stats::median(thresholds[which(j == max(j, na.rm = TRUE))], na.rm = TRUE)
 }
-has_two_binary_classes <- function(x) {
-  x <- x[!is.na(x)]
-  length(unique(x)) >= 2
-}
-ensure_result_metric_cols <- function(d) {
-  if ("Participant" %in% names(d)) {
-    d$Participant <- stringr::str_pad(as.character(d$Participant), width = 4, pad = "0")
-  }
-  for (cc in c("sensitivity", "specificity", "balanced_acc")) {
-    if (!cc %in% names(d)) d[[cc]] <- NA_real_
-  }
-  for (cc in c("n_SI", "n_nonSI")) {
-    if (!cc %in% names(d)) d[[cc]] <- NA_integer_
-  }
-  d
-}
-# --- CONTINUOUS ---
-fit_continuous <- function(pt, fb, cv_fn) {
-  feats <- candidate_predictors(pt)
-  if (length(feats)<1 || var(pt[[outcome]],na.rm=TRUE) %in% c(0,NA))
-    return(empty_row(pt$uid[1], "skipped"))
-  sl <- cv_fn(pt); if (is.null(sl) || length(sl$trains)<1) return(empty_row(pt$uid[1], "no_slices"))
-  preds <- list()
-  for (i in seq_along(sl$trains)) {
-    tr <- pt[sl$trains[[i]],]; vl <- pt[sl$vals[[i]],]; te <- pt[sl$tests[[i]],]
-    scale_cols <- feats   # within-fold min-max
-    tr_ref <- tr                                               # original train values
-    tr <- apply_minmax_fold(tr_ref, tr, scale_cols)
-    vl <- apply_minmax_fold(tr_ref, vl, scale_cols)
-    te <- apply_minmax_fold(tr_ref, te, scale_cols)
-    best <- list(score=Inf)
-    for (w in WINDOWS) {
-      pv <- intersect(fb(w, data_model_base), feats); if (length(pv)<2) next
-      pv <- drop_near_zero_variance_features(pv, tr, freqCut = 19, uniqueCut = 10); if (length(pv)<2) next
-      pp <- tryCatch(preProcess(tr[,pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
-      if (is.null(pp)) next
-      xtr <- tryCatch(predict(pp, tr[,pv,drop=FALSE]), error=function(e) NULL)
-      xvl <- tryCatch(predict(pp, vl[,pv,drop=FALSE]), error=function(e) NULL)
-      if (is.null(xtr) || is.null(xvl)) next
-      d_tr <- cbind(xtr, .y=tr[[outcome]]); names(d_tr)[ncol(d_tr)] <- outcome
-      for (mt in MTRY_GRID) for (nt in NTREE_GRID) {
-        s <- tryCatch({
-          m <- randomForest(as.formula(paste(outcome,"~ .")), data=d_tr,
-                            mtry=min(mt,ncol(xtr)), ntree=nt)
-          mean(abs(predict(m, xvl) - vl[[outcome]]), na.rm=TRUE)
-        }, error=function(e) NA_real_)
-        if (!is.na(s) && s < best$score) best <- list(score=s, w=w, pv=pv, mt=mt, nt=nt)
-      }
-    }
-    if (best$score==Inf) next
-    tv <- rbind(tr, vl)
-    pp2 <- tryCatch(preProcess(tv[,best$pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
-    if (is.null(pp2)) next
-    x_tv <- tryCatch(predict(pp2, tv[,best$pv,drop=FALSE]), error=function(e) NULL)
-    x_te <- tryCatch(predict(pp2, te[,best$pv,drop=FALSE]), error=function(e) NULL)
-    if (is.null(x_tv) || is.null(x_te)) next
-    d_tv <- cbind(x_tv, .y=tv[[outcome]]); names(d_tv)[ncol(d_tv)] <- outcome
-    mf <- tryCatch(randomForest(as.formula(paste(outcome,"~ .")), data=d_tv,
-                                mtry=min(best$mt,ncol(x_tv)), ntree=best$nt), error=function(e) NULL)
-    if (is.null(mf)) next
-    p <- tryCatch(predict(mf, x_te), error=function(e) NULL); if (is.null(p)) next
-    preds[[i]] <- data.frame(true=te[[outcome]], pred=as.numeric(p))
-  }
-  if (length(preds)==0) return(empty_row(pt$uid[1], "no_successful_folds"))
-  pdf_out <- bind_rows(preds)
-  met <- reg_metrics(pdf_out$pred, pdf_out$true)
-  ok_row(pt$uid[1], length(preds), nrow(pdf_out),
-         cor_v=met$cor, r2_v=met$r2, mse_v=met$mse, mae_v=met$mae, rmse_v=met$rmse)
-}
-fit_continuous_baseline <- function(pt, cv_fn) {
-  if (var(pt[[outcome]],na.rm=TRUE) %in% c(0,NA)) return(empty_row(pt$uid[1], "skipped"))
-  sl <- cv_fn(pt); if (is.null(sl)) return(empty_row(pt$uid[1], "no_slices"))
-  preds <- lapply(seq_along(sl$trains), function(i) {
-    tm <- mean(pt[[outcome]][sl$trains[[i]]], na.rm=TRUE); if (is.na(tm)) return(NULL)
-    data.frame(true=pt[[outcome]][sl$tests[[i]]], pred=rep(tm, length(sl$tests[[i]])))
-  })
-  preds <- Filter(Negate(is.null), preds)
-  if (length(preds)==0) return(empty_row(pt$uid[1], "no_successful_folds"))
-  pdf_out <- bind_rows(preds)
-  met <- reg_metrics(pdf_out$pred, pdf_out$true)
-  ok_row(pt$uid[1], length(preds), nrow(pdf_out),
-         cor_v=met$cor, r2_v=met$r2, mse_v=met$mse, mae_v=met$mae, rmse_v=met$rmse)
-}
-# --- HURDLE ---
-hurdle_one_fit <- function(tr_full, x_eval, ff) {
-  cls <- tryCatch(suppressWarnings(train(
-    as.formula(paste(".bin ~", paste(ff, collapse="+"))), data=tr_full, method="gbm",
-    trControl=trainControl(method="none", classProbs=TRUE),
-    tuneGrid=GBM_CLS, verbose=FALSE)), error=function(e) NULL)
-  if (is.null(cls)) return(NULL)
-  p_si <- tryCatch(predict(cls, x_eval, type="prob")[,"SI"], error=function(e) NULL)
-  if (is.null(p_si)) return(NULL)
-  sev <- rep(0, nrow(x_eval))
-  tr_si <- tr_full[tr_full[[outcome]] > 0,]
-  if (nrow(tr_si)>=10 && var(tr_si[[outcome]],na.rm=TRUE) > 0) {
-    reg <- tryCatch(suppressWarnings(train(
-      as.formula(paste(outcome,"~", paste(ff, collapse="+"))),
-      data=tr_si[,c(outcome,ff)], method="gbm",
-      trControl=trainControl(method="none"), tuneGrid=GBM_REG, verbose=FALSE)),
-      error=function(e) NULL)
-    if (!is.null(reg)) sev <- tryCatch(predict(reg, x_eval), error=function(e) rep(0, nrow(x_eval)))
-  }
-  list(pred=pmax(0, pmin(1, p_si * sev)), p_si=p_si)
-}
-fit_hurdle <- function(pt, fb, cv_fn) {
-  feats <- candidate_predictors(pt)
-  if (length(feats)<1 || var(pt[[outcome]],na.rm=TRUE) %in% c(0,NA))
-    return(empty_row(pt$uid[1], "skipped"))
-  n_si_pos <- sum(pt[[outcome]] > 0, na.rm = TRUE)
-  n_si_neg <- sum(pt[[outcome]] == 0, na.rm = TRUE)
-  if (n_si_pos < 10 || n_si_neg < 20) return(empty_row(pt$uid[1], "too_few_SI_counts"))
-  sl <- cv_fn(pt); if (is.null(sl) || length(sl$trains)<1)
-    return(empty_row(pt$uid[1], "no_slices"))
-  preds <- list()
-  for (i in seq_along(sl$trains)) {
-    tr <- pt[sl$trains[[i]],]; vl <- pt[sl$vals[[i]],]; te <- pt[sl$tests[[i]],]
-    scale_cols <- feats   # within-fold min-max
-    tr_ref <- tr
-    tr <- apply_minmax_fold(tr_ref, tr, scale_cols)
-    vl <- apply_minmax_fold(tr_ref, vl, scale_cols)
-    te <- apply_minmax_fold(tr_ref, te, scale_cols)
-    tv <- rbind(tr, vl); best <- list(score=-Inf, mae=Inf)
-    for (w in WINDOWS) {
-      pv <- intersect(fb(w, data_model_base), feats); if (length(pv)<2) next
-      pv <- drop_near_zero_variance_features(pv, tr, freqCut = 19, uniqueCut = 10); if (length(pv)<2) next
-      pp <- tryCatch(preProcess(tr[,pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
-      if (is.null(pp)) next
-      xtr <- tryCatch(predict(pp, tr[,pv,drop=FALSE]), error=function(e) NULL)
-      xvl <- tryCatch(predict(pp, vl[,pv,drop=FALSE]), error=function(e) NULL)
-      if (is.null(xtr) || is.null(xvl)) next
-      tr_full <- cbind(xtr, .y=tr[[outcome]]); names(tr_full)[ncol(tr_full)] <- outcome
-      tr_full$.bin <- factor(ifelse(tr_full[[outcome]] > 0, "SI","noSI"), levels=c("noSI","SI"))
-      if (length(unique(tr_full$.bin)) < 2) next
-      ff <- setdiff(names(tr_full), c(outcome, ".bin"))
-      h <- hurdle_one_fit(tr_full, xvl, ff); if (is.null(h)) next
-      vl_bin <- as.integer(vl[[outcome]] > 0)
-      threshold <- choose_youden_threshold(
-        true_bin = vl_bin,
-        p_si = h$p_si
-      )
-      if (!has_two_binary_classes(vl_bin)) {
-        h_train <- hurdle_one_fit(tr_full, xtr, ff)
-        if (!is.null(h_train)) {
-          threshold <- choose_youden_threshold(
-            true_bin = as.integer(tr[[outcome]] > 0),
-            p_si = h_train$p_si
-          )
-        }
-      }
-      bin <- binary_metrics(
-        true_bin = vl_bin,
-        p_si = h$p_si,
-        threshold = threshold
-      )
-      s <- mean(abs(h$pred - vl[[outcome]]), na.rm=TRUE)
-      if (!is.na(bin$balanced_acc) &&
-          (bin$balanced_acc > best$score ||
-           (bin$balanced_acc == best$score && !is.na(s) && s < best$mae))) {
-        best <- list(score=bin$balanced_acc, mae=s, w=w, pv=pv, threshold=threshold)
-      }
-    }
-    if (best$score == -Inf) next
-    pp2 <- tryCatch(preProcess(tv[,best$pv,drop=FALSE], method=c("zv","knnImpute"), k=5), error=function(e) NULL)
-    if (is.null(pp2)) next
-    x_tv <- tryCatch(predict(pp2, tv[,best$pv,drop=FALSE]), error=function(e) NULL)
-    x_te <- tryCatch(predict(pp2, te[,best$pv,drop=FALSE]), error=function(e) NULL)
-    if (is.null(x_tv) || is.null(x_te)) next
-    tv_full <- cbind(x_tv, .y=tv[[outcome]]); names(tv_full)[ncol(tv_full)] <- outcome
-    tv_full$.bin <- factor(ifelse(tv_full[[outcome]] > 0, "SI","noSI"), levels=c("noSI","SI"))
-    if (length(unique(tv_full$.bin)) < 2) next
-    ff <- setdiff(names(tv_full), c(outcome, ".bin"))
-    h <- hurdle_one_fit(tv_full, x_te, ff); if (is.null(h)) next
-    preds[[i]] <- data.frame(true=te[[outcome]], pred=h$pred,
-                             p_si=h$p_si, true_bin=as.integer(te[[outcome]]>0),
-                             threshold=best$threshold)
-  }
-  if (length(preds)==0) return(empty_row(pt$uid[1], "no_successful_folds"))
-  pdf_out <- bind_rows(preds)
-  auc_v <- tryCatch({
-    if (length(unique(pdf_out$true_bin))<2) NA_real_
-    else as.numeric(pROC::auc(pROC::roc(pdf_out$true_bin, pdf_out$p_si, quiet=TRUE)))
-  }, error=function(e) NA_real_)
-  met <- reg_metrics(pdf_out$pred, pdf_out$true)
-  bin <- binary_metrics(pdf_out$true_bin, pdf_out$p_si, threshold = pdf_out$threshold)
-  ok_row(pt$uid[1], length(preds), nrow(pdf_out),
-         cor_v=met$cor, r2_v=met$r2, mse_v=met$mse, mae_v=met$mae, rmse_v=met$rmse,
-         auc_v=auc_v, sensitivity_v=bin$sensitivity, specificity_v=bin$specificity,
-         balanced_acc_v=bin$balanced_acc,
-         n_SI_v=sum(pdf_out$true_bin == 1, na.rm = TRUE),
-         n_nonSI_v=sum(pdf_out$true_bin == 0, na.rm = TRUE))
-}
-fit_hurdle_baseline <- function(pt, cv_fn) {
-  if (var(pt[[outcome]],na.rm=TRUE) %in% c(0,NA)) return(empty_row(pt$uid[1], "skipped"))
-  sl <- cv_fn(pt); if (is.null(sl)) return(empty_row(pt$uid[1], "no_slices"))
-  preds <- lapply(seq_along(sl$trains), function(i) {
-    tr_y <- pt[[outcome]][sl$trains[[i]]]
-    vl_y <- pt[[outcome]][sl$vals[[i]]]
-    p_si <- mean(tr_y > 0, na.rm=TRUE)
-    sev  <- mean(tr_y[tr_y > 0], na.rm=TRUE); if (is.na(sev)) sev <- 0
-    final <- max(0, min(1, p_si * sev))
-    te_y <- pt[[outcome]][sl$tests[[i]]]
-    threshold <- choose_youden_threshold(
-      true_bin = as.integer(vl_y > 0),
-      p_si = rep(p_si, length(vl_y))
-    )
-    data.frame(true=te_y, pred=rep(final, length(te_y)),
-               p_si=rep(p_si, length(te_y)), true_bin=as.integer(te_y>0),
-               threshold=threshold)
-  })
-  preds <- Filter(Negate(is.null), preds)
-  if (length(preds)==0) return(empty_row(pt$uid[1], "no_successful_folds"))
-  pdf_out <- bind_rows(preds)
-  auc_v <- tryCatch({
-    if (length(unique(pdf_out$true_bin))<2) NA_real_
-    else as.numeric(pROC::auc(pROC::roc(pdf_out$true_bin, pdf_out$p_si, quiet=TRUE)))
-  }, error=function(e) NA_real_)
-  met <- reg_metrics(pdf_out$pred, pdf_out$true)
-  bin <- binary_metrics(pdf_out$true_bin, pdf_out$p_si, threshold = pdf_out$threshold)
-  ok_row(pt$uid[1], length(preds), nrow(pdf_out),
-         cor_v=met$cor, r2_v=met$r2, mse_v=met$mse, mae_v=met$mae, rmse_v=met$rmse,
-         auc_v=auc_v, sensitivity_v=bin$sensitivity, specificity_v=bin$specificity,
-         balanced_acc_v=bin$balanced_acc,
-         n_SI_v=sum(pdf_out$true_bin == 1, na.rm = TRUE),
-         n_nonSI_v=sum(pdf_out$true_bin == 0, na.rm = TRUE))
-}
-# Generic parallel runner — parameterized by CV fn
-run_one <- function(model_type, config_name, fb=NULL, cv_fn) {
-  cat(sprintf("===== %s | %s =====\n", model_type, config_name)); t0 <- Sys.time()
-  uids <- unique(data_model_base$uid)
-  cl <- makeCluster(min(N_CORES, detectCores()-1, length(uids)))
-  registerDoParallel(cl); on.exit(stopCluster(cl))
-  out <- foreach(u=uids, .combine=bind_rows, .errorhandling="remove",
-                 .packages=c("caret","randomForest","gbm","pROC","dplyr"),
-                 .export=c("data_model_base","outcome","WINDOWS","MTRY_GRID","NTREE_GRID",
-                           "GBM_CLS","GBM_REG","apply_minmax_fold",
-                           "candidate_predictors",
-                           "drop_near_zero_variance_features","is_passive_feature",
-                           "reg_metrics","binary_metrics","choose_youden_threshold",
-                           "has_two_binary_classes",
-                           "fit_continuous","fit_continuous_baseline",
-                           "fit_hurdle","fit_hurdle_baseline","hurdle_one_fit",
-                           "empty_row","ok_row",
-                           "ema_mean","ema_dyn","sensors","pmean","pdyn",
-                           "get_passive_mean_cols","get_passive_dynamic_cols",
-                           "configs","cv_fn")) %dopar% {
-                             pt <- data_model_base[data_model_base$uid==u, , drop=FALSE]
-                             tryCatch({
-                               if (model_type == "Continuous") {
-                                 if (config_name == "Baseline") fit_continuous_baseline(pt, cv_fn) else fit_continuous(pt, fb, cv_fn)
-                               } else if (model_type == "Hurdle") {
-                                 if (config_name == "Baseline") fit_hurdle_baseline(pt, cv_fn) else fit_hurdle(pt, fb, cv_fn)
-                               }
-                             }, error = function(e) empty_row(u, paste0("error: ", conditionMessage(e))))
-                           }
-  out$model_type <- model_type
-  out$config     <- config_name
-  out <- ensure_result_metric_cols(out)
-  cat(sprintf("  %.1f min, n_ok=%d/%d\n",
-              as.numeric(difftime(Sys.time(),t0,units="mins")),
-              sum(out$status=="ok"), nrow(out)))
-  out
-}
-# Run all configs for a given CV variant
-run_variant <- function(variant_name, cv_params) {
-  results_path <- file.path(model_config_cache_dir, sprintf("All_models_results_%s.csv", variant_name))
-  results_stale <- file.exists(results_path) &&
-    file.exists(data_model_path) &&
-    file.info(data_model_path)$mtime > file.info(results_path)$mtime
-  if (file.exists(results_path) && !RERUN_MODEL_RESULTS && !results_stale) {
-    cat(sprintf("\n--- Variant '%s' cached, skipping ---\n", variant_name))
-    return(ensure_result_metric_cols(read.csv(results_path, stringsAsFactors=FALSE)))
-  }
-  cat(sprintf("\n========== Variant: %s (train=%d, val=%d, test=%d) ==========\n",
-              variant_name, cv_params$train_days, cv_params$val_days, cv_params$test_days))
-  cv_fn <- make_sliding_cv(cv_params$train_days, cv_params$val_days,
-                           cv_params$test_days, cv_params$ema_per_day)
-  backfill_hurdle_class_counts <- function(out) {
-    out <- ensure_result_metric_cols(out)
-    if (!nrow(out) || !("model_type" %in% names(out)) || !any(out$model_type == "Hurdle")) return(out)
-    out$Participant <- stringr::str_pad(as.character(out$Participant), width = 4, pad = "0")
-    needs_counts <- out$model_type == "Hurdle" &
-      (is.na(out$n_SI) | is.na(out$n_nonSI)) &
-      out$status == "ok"
-    if (!any(needs_counts)) return(out)
-    for (rr in which(needs_counts)) {
-      u <- stringr::str_pad(as.character(out$Participant[rr]), width = 4, pad = "0")
-      pt <- data_model_base[data_model_base$uid == u, , drop = FALSE]
-      if (!nrow(pt)) next
-      sl <- cv_fn(pt)
-      if (is.null(sl) || !length(sl$tests)) next
-      y <- pt[[outcome]][unlist(sl$tests)]
-      if (is.finite(out$n_obs[rr]) && out$n_obs[rr] > 0 && out$n_obs[rr] < length(y)) {
-        y <- y[seq_len(out$n_obs[rr])]
-      }
-      out$n_SI[rr] <- sum(y > 0, na.rm = TRUE)
-      out$n_nonSI[rr] <- sum(y == 0, na.rm = TRUE)
-    }
-    out
-  }
-  run_one_cached <- function(model_type, config_name, fb = NULL) {
-    cache_file <- file.path(
-      model_config_cache_dir,
-      sprintf("model_results_%s_%s_%s.csv",
-              variant_name,
-              gsub("[^A-Za-z0-9]+", "_", model_type),
-              gsub("[^A-Za-z0-9]+", "_", config_name))
-    )
-    cache_stale <- file.exists(cache_file) &&
-      file.exists(data_model_path) &&
-      file.info(data_model_path)$mtime > file.info(cache_file)$mtime
-    if (file.exists(cache_file) && !RERUN_COMPLETED_CONFIGS && !cache_stale) {
-      cat(sprintf("===== %s | %s =====\n", model_type, config_name))
-      cat(sprintf("  cached, skipping: %s\n", cache_file))
-      out <- ensure_result_metric_cols(read.csv(cache_file, stringsAsFactors = FALSE))
-      out$model_type <- model_type
-      out$config <- config_name
-      out <- backfill_hurdle_class_counts(out)
-      write.csv(out, cache_file, row.names = FALSE)
-      return(out)
-    }
-    out <- run_one(model_type, config_name, fb = fb, cv_fn = cv_fn)
-    write.csv(out, cache_file, row.names = FALSE)
-    cat(sprintf("  cached result saved: %s\n", cache_file))
-    ensure_result_metric_cols(out)
-  }
-  all_res <- list()
-  # Run one baseline benchmark plus the six planned feature-set models.
-  # Baseline is retained for comparison statistics but is not counted as a feature-set model.
-  if (RUN_CONTINUOUS_MODELS) {
-    all_res[["Cont_Baseline"]] <- run_one_cached("Continuous", "Baseline")
-    for (cn in MODEL_CONFIGS)
-      all_res[[paste0("Cont_", cn)]] <- run_one_cached("Continuous", cn, fb=configs[[cn]])
-  }
-  if (RUN_HURDLE_MODELS) {
-    all_res[["Hurdle_Baseline"]] <- run_one_cached("Hurdle", "Baseline")
-    for (cn in MODEL_CONFIGS)
-      all_res[[paste0("Hurdle_", cn)]] <- run_one_cached("Hurdle", cn, fb=configs[[cn]])
-  }
-  combined <- bind_rows(all_res) %>%
-    select(model_type, config, Participant,
-           cor, r2, mse, mae, rmse, auc, sensitivity, specificity, balanced_acc,
-           n_obs, n_SI, n_nonSI, n_folds, status) %>%
-    mutate(variant=variant_name)
-  combined <- backfill_hurdle_class_counts(combined)
-  write.csv(combined, results_path, row.names=FALSE)
-  cat(sprintf("✅ Cached combined model results: %s (%d rows)\n", results_path, nrow(combined)))
-  ensure_result_metric_cols(combined)
-}
-results_main  <- run_variant("main",  CV_VARIANTS$main)
-print_summary <- function(combined, label) {
-  cat(sprintf("\n===== Summary [%s] (n_folds >= %d, status==ok) =====\n", label, MIN_FOLDS))
-  s <- combined %>% filter(status=="ok", n_folds>=MIN_FOLDS) %>%
-    group_by(model_type, config) %>%
-    summarise(n=n(),
-              median_cor =round(median(cor,  na.rm=TRUE),3),
-              mean_r2    =round(mean(r2,    na.rm=TRUE),3),
-              median_r2  =round(median(r2,   na.rm=TRUE),3),
-              median_mse =round(median(mse,  na.rm=TRUE),3),
-              median_mae =round(median(mae,  na.rm=TRUE),3),
-              median_rmse=round(median(rmse, na.rm=TRUE),3),
-              median_auc =round(median(auc,  na.rm=TRUE),3),
-              median_sensitivity =round(median(sensitivity,  na.rm=TRUE),3),
-              median_specificity =round(median(specificity,  na.rm=TRUE),3),
-              median_balanced_acc=round(median(balanced_acc, na.rm=TRUE),3),
-              .groups="drop") %>%
-    arrange(model_type, desc(coalesce(median_auc, median_cor)))
-  print(s, n=Inf); s
-}
-summary_main  <- print_summary(results_main,  "main")
 
-diagnose_continuous_model_failures <- function(combined, variant_name = "main",
-                                               min_folds = MIN_FOLDS) {
-  analytic_uids <- data_model_base %>%
-    distinct(uid) %>%
-    mutate(uid = as.character(uid)) %>%
-    pull(uid)
-  cont <- combined %>%
-    filter(variant == variant_name,
-           model_type == "Continuous",
-           config %in% MODEL_CONFIGS) %>%
-    mutate(
-      evaluable = status == "ok" & n_folds >= min_folds,
-      Participant = as.character(Participant)
-    )
-  outcome_diag <- data_model_base %>%
-    group_by(uid) %>%
+binary_metrics <- function(true_bin, p_si, threshold) {
+  ok <- !is.na(true_bin) & !is.na(p_si)
+  true_bin <- as.integer(true_bin[ok]); p_si <- p_si[ok]
+  threshold <- if (length(threshold) == 1L) rep(threshold, length(p_si)) else threshold[ok]
+  if (!length(true_bin) || length(unique(true_bin)) < 2)
+    return(list(sensitivity = NA_real_, specificity = NA_real_, balanced_acc = NA_real_))
+  pred <- as.integer(p_si >= threshold)
+  tp <- sum(pred == 1 & true_bin == 1); fn <- sum(pred == 0 & true_bin == 1)
+  tn <- sum(pred == 0 & true_bin == 0); fp <- sum(pred == 1 & true_bin == 0)
+  sens <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
+  spec <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
+  list(sensitivity = sens, specificity = spec,
+       balanced_acc = mean(c(sens, spec), na.rm = TRUE))
+}
+
+# ------------------------------------------------------------------------------
+# 5. RUN ONE CONFIGURATION
+# ------------------------------------------------------------------------------
+run_config <- function(data_model, outcome, config, n_cores = N_CORES) {
+  
+  candidates <- make_candidates(config)
+  uids <- unique(data_model$uid)
+  n_cores <- max(1, min(n_cores, parallel::detectCores() - 1, length(uids)))
+  
+  cl <- parallel::makeCluster(n_cores)
+  parallel::clusterSetRNGStream(cl, 12361488)
+  doParallel::registerDoParallel(cl)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  
+  cat(sprintf("\n=== %s === (%d participants | %d candidate feature sets | %d cores)\n",
+              config, length(uids), length(candidates), n_cores))
+  
+  res <- foreach::foreach(
+    h = seq_along(uids),
+    .packages = c("caret", "gbm", "dplyr"),
+    .export = c("SlidingWindow_CV_prereg", "fit_preprocess", "usable_in",
+                "drop_near_zero_variance", "MIN_NONMISSING", "hurdle_fit",
+                "choose_youden_threshold", "binary_metrics",
+                "GBM_CLS", "GBM_REG", "MIN_SI_TRAIN", "OUTCOME_MAX"),
+    .errorhandling = "pass"
+  ) %dopar% {
+    
+    uid <- uids[h]
+    pt  <- data_model[data_model$uid == uid, , drop = FALSE]
+    
+    if (length(unique(as.integer(pt[[outcome]] > 0))) < 2)
+      return(list(preds = NULL, status = "single_outcome_class", uid = uid))
+    
+    slices <- SlidingWindow_CV_prereg(pt)
+    if (is.null(slices) || !length(slices$trains))
+      return(list(preds = NULL, status = "too_few_rows_for_CV", uid = uid))
+    
+    usable <- names(pt)[vapply(pt, function(z) is.numeric(z) && !all(is.na(z)), logical(1))]
+    fold_preds <- list()
+    
+    for (i in seq_along(slices$trains)) {
+      tr <- pt[slices$trains[[i]], , drop = FALSE]
+      vl <- pt[slices$vals[[i]],   , drop = FALSE]
+      te <- pt[slices$tests[[i]],  , drop = FALSE]
+      
+      y_tr <- tr[[outcome]]; y_vl <- vl[[outcome]]; y_te <- te[[outcome]]
+      if (length(unique(as.integer(y_tr > 0))) < 2) next   # both classes needed
+      
+      # ---- Baseline: training P(SI) x training mean non-zero severity --------
+      if (config == "Baseline") {
+        p_si <- mean(y_tr > 0, na.rm = TRUE)
+        sev  <- mean(y_tr[y_tr > 0], na.rm = TRUE); if (is.na(sev)) sev <- 0
+        thr  <- choose_youden_threshold(as.integer(y_vl > 0), rep(p_si, length(y_vl)))
+        fold_preds[[length(fold_preds) + 1L]] <- data.frame(
+          fold = i, uid = uid, true = y_te, true_bin = as.integer(y_te > 0),
+          p_si = p_si, sev = sev,
+          pred = pmax(0, pmin(OUTCOME_MAX, p_si * sev)),
+          threshold = thr, ema_window = NA_character_, window = NA_character_,
+          stringsAsFactors = FALSE)
+        next
+      }
+      
+      best <- list(score = -Inf, mae = Inf)
+      
+      for (cand in candidates) {
+        pv <- usable_in(intersect(cand$vars, usable), tr)
+        pv <- drop_near_zero_variance(pv, tr)
+        if (length(pv) < 2) next
+        
+        pp <- fit_preprocess(tr, pv)
+        if (is.null(pp)) next
+        x_tr <- tryCatch(predict(pp, tr[, pv, drop = FALSE]), error = function(e) NULL)
+        x_vl <- tryCatch(predict(pp, vl[, pv, drop = FALSE]), error = function(e) NULL)
+        if (is.null(x_tr) || is.null(x_vl)) next
+        
+        h_vl <- hurdle_fit(x_tr, y_tr, x_vl)
+        if (is.null(h_vl)) next
+        
+        thr <- choose_youden_threshold(as.integer(y_vl > 0), h_vl$p_si)
+        bm  <- binary_metrics(as.integer(y_vl > 0), h_vl$p_si, thr)
+        mae <- mean(abs(h_vl$pred - y_vl), na.rm = TRUE)
+        
+        # select on validation balanced accuracy, break ties on validation MAE
+        sc <- bm$balanced_acc
+        if (!is.na(sc) && (sc > best$score ||
+                           (sc == best$score && is.finite(mae) && mae < best$mae)))
+          best <- list(score = sc, mae = mae, vars = pv, threshold = thr,
+                       ema_window = cand$ema_window, window = cand$window)
+      }
+      
+      if (!is.finite(best$score)) next
+      
+      # ---- refit on train+val, predict test ----------------------------------
+      tv   <- dplyr::bind_rows(tr, vl)
+      y_tv <- tv[[outcome]]
+      bv <- usable_in(best$vars, tv)
+      bv <- drop_near_zero_variance(bv, tv)
+      if (length(bv) < 2) next
+      
+      pp2 <- fit_preprocess(tv, bv)
+      if (is.null(pp2)) next
+      x_tv <- tryCatch(predict(pp2, tv[, bv, drop = FALSE]), error = function(e) NULL)
+      x_te <- tryCatch(predict(pp2, te[, bv, drop = FALSE]), error = function(e) NULL)
+      if (is.null(x_tv) || is.null(x_te)) next
+      
+      h_te <- hurdle_fit(x_tv, y_tv, x_te)
+      if (is.null(h_te)) next
+      
+      fold_preds[[length(fold_preds) + 1L]] <- data.frame(
+        fold = i, uid = uid, true = y_te, true_bin = as.integer(y_te > 0),
+        p_si = h_te$p_si, sev = h_te$sev, pred = h_te$pred,
+        threshold = best$threshold,          # chosen on VALIDATION, not test
+        ema_window = best$ema_window, window = best$window,
+        stringsAsFactors = FALSE)
+    }
+    
+    if (!length(fold_preds))
+      return(list(preds = NULL, status = "no_fold_succeeded", uid = uid))
+    
+    list(preds = dplyr::bind_rows(fold_preds), status = "ok", uid = uid)
+  }
+  
+  errored <- vapply(res, function(x) inherits(x, "error"), logical(1))
+  if (any(errored))
+    cat(sprintf("  %d participant(s) errored; first message: %s\n",
+                sum(errored), conditionMessage(res[errored][[1]])))
+  res <- res[!errored]
+  
+  status <- vapply(res, function(x) x$status, character(1))
+  if (any(status != "ok")) {
+    tab <- table(status[status != "ok"])
+    cat(sprintf("  dropped: %s\n",
+                paste(sprintf("%s=%d", names(tab), as.integer(tab)), collapse = ", ")))
+  }
+  cat(sprintf("  retained %d / %d participants\n", sum(status == "ok"), length(uids)))
+  
+  ok <- Filter(function(x) identical(x$status, "ok"), res)
+  if (!length(ok)) return(NULL)
+  dplyr::bind_rows(lapply(ok, `[[`, "preds")) %>% mutate(Configuration = config)
+}
+
+# ------------------------------------------------------------------------------
+# 6. METRICS
+#    AUC from the occurrence probability; sensitivity/specificity/balanced
+#    accuracy at the VALIDATION-selected threshold; MAE/MSE on the combined
+#    prediction, plus MAE restricted to true SI-positive test observations.
+# ------------------------------------------------------------------------------
+participant_metrics <- function(preds) {
+  preds %>%
+    group_by(Configuration, uid) %>%
     summarise(
-      model_rows = n(),
-      observed_q9 = sum(!is.na(q9)),
-      q9_positive = sum(q9 > 0, na.rm = TRUE),
-      q9_zero = sum(q9 == 0, na.rm = TRUE),
-      q9_variance = stats::var(q9, na.rm = TRUE),
+      AUC = if (length(unique(true_bin)) < 2) NA_real_
+      else suppressMessages(as.numeric(pROC::auc(pROC::roc(true_bin, p_si, quiet = TRUE)))),
+      Sensitivity  = binary_metrics(true_bin, p_si, threshold)$sensitivity,
+      Specificity  = binary_metrics(true_bin, p_si, threshold)$specificity,
+      BalancedAcc  = binary_metrics(true_bin, p_si, threshold)$balanced_acc,
+      MAE    = mean(abs(pred - true), na.rm = TRUE),
+      MSE    = mean((pred - true)^2, na.rm = TRUE),
+      MAE_SI = if (sum(true_bin == 1) == 0) NA_real_
+      else mean(abs(pred[true_bin == 1] - true[true_bin == 1]), na.rm = TRUE),
+      n_obs   = dplyr::n(),
+      n_SI    = sum(true_bin == 1),
+      n_nonSI = sum(true_bin == 0),
+      n_folds = dplyr::n_distinct(fold),
+      .groups = "drop"
+    )
+}
+
+fmt_iqr <- function(x, digits = 3, plus = FALSE) {
+  x <- x[is.finite(x)]
+  if (!length(x)) return("")
+  q <- stats::quantile(x, c(.25, .5, .75), na.rm = TRUE)
+  f <- function(v) {
+    s <- sprintf(paste0("%.", digits, "f"), v)
+    if (plus && v > 0) paste0("+", s) else s
+  }
+  sprintf("%s [%s, %s]", f(q[2]), f(q[1]), f(q[3]))
+}
+
+make_table <- function(metrics) {
+  metrics %>%
+    group_by(Configuration) %>%
+    summarise(
+      n                             = sum(!is.na(AUC)),
+      `AUC, median [IQR]`           = fmt_iqr(AUC, 3),
+      `% AUC>0.5`                   = sprintf("%.0f%%", 100 * mean(AUC > 0.5, na.rm = TRUE)),
+      `Sensitivity, median [IQR]`   = fmt_iqr(Sensitivity, 2),
+      `Specificity, median [IQR]`   = fmt_iqr(Specificity, 2),
+      `Balanced acc., median [IQR]` = fmt_iqr(BalancedAcc, 2),
+      `MAE, median [IQR]`           = fmt_iqr(MAE, 4),
+      `MAE (SI days), median [IQR]` = fmt_iqr(MAE_SI, 4),
       .groups = "drop"
     ) %>%
-    mutate(uid = as.character(uid))
-  predictor_diag <- bind_rows(lapply(analytic_uids, function(u) {
-    pt <- data_model_base[data_model_base$uid == u, , drop = FALSE]
-    data.frame(
-      uid = u,
-      candidate_predictors = length(candidate_predictors(pt)),
-      ema_mean_predictors = length(intersect(ema_mean, names(pt))),
-      ema_dynamic_predictors = length(intersect(ema_dyn, names(pt))),
-      passive_mean_predictors = length(intersect(unique(unlist(lapply(WINDOWS, pmean, d = data_model_base))), names(pt))),
-      passive_dynamic_predictors = length(intersect(unique(unlist(lapply(WINDOWS, pdyn, d = data_model_base))), names(pt))),
-      stringsAsFactors = FALSE
-    )
-  }))
-  by_config <- cont %>%
-    left_join(outcome_diag, by = c("Participant" = "uid")) %>%
-    left_join(predictor_diag, by = c("Participant" = "uid")) %>%
-    arrange(config, desc(evaluable), status, Participant)
-  by_participant <- by_config %>%
-    group_by(Participant) %>%
-    summarise(
-      n_configs_ok = sum(evaluable, na.rm = TRUE),
-      configs_failed = paste(config[!evaluable], collapse = ", "),
-      statuses = paste(unique(status[!evaluable]), collapse = "; "),
-      min_folds_observed = min(n_folds, na.rm = TRUE),
-      max_folds_observed = max(n_folds, na.rm = TRUE),
-      model_rows = dplyr::first(model_rows),
-      observed_q9 = dplyr::first(observed_q9),
-      q9_positive = dplyr::first(q9_positive),
-      q9_zero = dplyr::first(q9_zero),
-      q9_variance = dplyr::first(q9_variance),
-      candidate_predictors = dplyr::first(candidate_predictors),
-      .groups = "drop"
-    ) %>%
-    mutate(all_six_configs_ok = n_configs_ok == length(MODEL_CONFIGS)) %>%
-    arrange(n_configs_ok, Participant)
-  out_config <- file.path(report_dir, sprintf("continuous_model_failure_diagnostic_by_config_%s.csv", variant_name))
-  out_pt <- file.path(report_dir, sprintf("continuous_model_failure_diagnostic_by_participant_%s.csv", variant_name))
-  write.csv(by_config, out_config, row.names = FALSE)
-  write.csv(by_participant, out_pt, row.names = FALSE)
-  cat(sprintf("Saved continuous model diagnostics: %s\n", out_config))
-  cat(sprintf("Saved continuous model diagnostics: %s\n", out_pt))
-  cat("\nContinuous model evaluability by config:\n")
-  print(cont %>%
-          group_by(config, status) %>%
-          summarise(n_pt = n_distinct(Participant),
-                    median_folds = median(n_folds, na.rm = TRUE),
-                    .groups = "drop") %>%
-          arrange(config, status), n = Inf)
-  invisible(list(by_config = by_config, by_participant = by_participant))
+    mutate(Configuration = factor(Configuration, levels = CONFIGS)) %>%
+    arrange(Configuration)
 }
 
-if (isTRUE(RUN_MODEL_DIAGNOSTICS)) {
-  continuous_failure_diagnostics_main <- diagnose_continuous_model_failures(results_main, "main", MIN_FOLDS)
-} else {
-  continuous_failure_diagnostics_main <- NULL
-  cat("Skipping continuous model diagnostics (RUN_MODEL_DIAGNOSTICS=FALSE)\n")
+# ------------------------------------------------------------------------------
+# 7. RUN ALL CONFIGURATIONS
+# ------------------------------------------------------------------------------
+all_preds <- list()
+for (cfg in CONFIGS) {
+  t0 <- Sys.time()
+  all_preds[[cfg]] <- run_config(dat, OUTCOME, cfg)
+  cat(sprintf("  done in %.1f min\n", as.numeric(difftime(Sys.time(), t0, units = "mins"))))
 }
 
-compare_models_to_baseline <- function(combined, variant_name = "main",
-                                       min_folds = MIN_FOLDS) {
-  metrics <- tibble::tribble(
-    ~metric, ~higher_is_better,
-    "r2",    TRUE,
-    "cor",   TRUE,
-    "mae",   FALSE,
-    "rmse",  FALSE,
-    "mse",   FALSE,
-    "auc",   TRUE,
-    "sensitivity", TRUE,
-    "specificity", TRUE,
-    "balanced_acc", TRUE
-  )
-  valid <- combined %>%
-    filter(status == "ok", n_folds >= min_folds, variant == variant_name)
-  out <- list()
-  k <- 1L
-  for (mt in unique(valid$model_type)) {
-    base <- valid %>%
-      filter(model_type == mt, config == "Baseline") %>%
-      select(Participant, all_of(metrics$metric))
-    if (!nrow(base)) next
-    for (cfg in setdiff(unique(valid$config[valid$model_type == mt]), "Baseline")) {
-      cfg_dat <- valid %>%
-        filter(model_type == mt, config == cfg) %>%
-        select(Participant, all_of(metrics$metric))
-      paired <- inner_join(cfg_dat, base, by = "Participant", suffix = c("_model", "_baseline"))
-      for (ii in seq_len(nrow(metrics))) {
-        mm <- metrics$metric[ii]
-        hi <- metrics$higher_is_better[ii]
-        model_col <- paste0(mm, "_model")
-        base_col  <- paste0(mm, "_baseline")
-        if (!model_col %in% names(paired) || !base_col %in% names(paired)) next
-        d <- paired %>%
-          transmute(
-            diff_raw = .data[[model_col]] - .data[[base_col]],
-            diff_better = if (hi) diff_raw else -diff_raw
-          ) %>%
-          filter(is.finite(diff_raw), is.finite(diff_better))
-        if (nrow(d) < 5 || length(unique(d$diff_better)) < 2) next
-        wt <- tryCatch(
-          suppressWarnings(stats::wilcox.test(d$diff_better, mu = 0, alternative = "greater",
-                                              exact = FALSE, paired = FALSE)),
-          error = function(e) NULL
-        )
-        out[[k]] <- data.frame(
-          variant = variant_name,
-          model_type = mt,
-          config = cfg,
-          metric = mm,
-          higher_is_better = hi,
-          n_paired = nrow(d),
-          median_model_minus_baseline = median(d$diff_raw, na.rm = TRUE),
-          median_improvement = median(d$diff_better, na.rm = TRUE),
-          mean_improvement = mean(d$diff_better, na.rm = TRUE),
-          pct_better_than_baseline = mean(d$diff_better > 0, na.rm = TRUE) * 100,
-          p_value = if (is.null(wt)) NA_real_ else wt$p.value,
-          stringsAsFactors = FALSE
-        )
-        k <- k + 1L
-      }
-    }
-  }
-  res <- bind_rows(out)
-  if (nrow(res)) {
-    res <- res %>%
-      group_by(model_type, metric) %>%
-      mutate(p_fdr = p.adjust(p_value, method = "BH"),
-             significant_fdr_05 = !is.na(p_fdr) & p_fdr < 0.05) %>%
-      ungroup() %>%
-      arrange(model_type, metric, p_fdr, p_value)
-    cat("\n===== Models Significantly Better Than Baseline (FDR < .05) =====\n")
-    print(res %>% filter(significant_fdr_05) %>%
-            arrange(model_type, metric, p_fdr), n = Inf)
-  } else {
-    cat("No valid paired baseline comparisons available.\n")
-  }
-  invisible(res)
-}
+preds_all   <- dplyr::bind_rows(all_preds)
+metrics_all <- participant_metrics(preds_all)
 
-baseline_tests_main <- compare_models_to_baseline(results_main, "main", MIN_FOLDS)
+table_all <- make_table(metrics_all)
 
-make_predictive_performance_tables <- function(combined, baseline_tests = NULL,
-                                               variant_name = "main",
-                                               min_folds = MIN_FOLDS) {
-  combined <- ensure_result_metric_cols(combined)
-  config_label_map <- c(
-    Baseline = "Baseline",
-    EMA_mean = "EMA",
-    EMA_mean_dynamic = "EMA (dynamic)",
-    Opt_Passive_mean = "Passive",
-    Opt_Passive_mean_dynamic = "Passive (dynamic)",
-    EMA_Opt_Passive_mean = "EMA + Passive",
-    EMA_Opt_Passive_mean_dynamic = "EMA + Passive (dynamic)"
-  )
-  config_order <- c("Baseline", MODEL_CONFIGS)
-  fmt_num <- function(x, digits = 3, plus = FALSE) {
-    if (is.na(x) || !is.finite(x)) return("")
-    out <- sprintf(paste0("%.", digits, "f"), x)
-    if (plus && x > 0) out <- paste0("+", out)
-    out
-  }
-  fmt_iqr <- function(x, digits = 3, plus = FALSE) {
-    x <- x[is.finite(x)]
-    if (!length(x)) return("")
-    qs <- stats::quantile(x, probs = c(.25, .5, .75), na.rm = TRUE)
-    sprintf("%s [%s, %s]",
-            fmt_num(qs[2], digits, plus),
-            fmt_num(qs[1], digits, plus),
-            fmt_num(qs[3], digits, plus))
-  }
-  pct_gt <- function(x, threshold) {
-    x <- x[is.finite(x)]
-    if (!length(x)) return("")
-    sprintf("%.0f%%", mean(x > threshold, na.rm = TRUE) * 100)
-  }
-  summarize_config <- function(model_type_i, config_i) {
-    combined %>%
-      filter(status == "ok", n_folds >= min_folds, variant == variant_name,
-             model_type == model_type_i, config == config_i)
-  }
-  cont_raw <- bind_rows(lapply(config_order, function(cfg) {
-    d <- summarize_config("Continuous", cfg)
-    data.frame(
-      `Model type` = "Continuous",
-      Configuration = unname(config_label_map[cfg]),
-      n = nrow(d),
-      cor_median = median(d$cor, na.rm = TRUE),
-      r2_median = median(d$r2, na.rm = TRUE),
-      mae_median = median(d$mae, na.rm = TRUE),
-      rmse_median = median(d$rmse, na.rm = TRUE),
-      `% r>0` = pct_gt(d$cor, 0),
-      `r, median [IQR]` = fmt_iqr(d$cor, 3, plus = TRUE),
-      `R², median [IQR]` = fmt_iqr(d$r2, 3, plus = TRUE),
-      `MAE, median [IQR]` = fmt_iqr(d$mae, 4),
-      `RMSE, median [IQR]` = fmt_iqr(d$rmse, 4),
-      check.names = FALSE
-    )
-  }))
-  hurdle_raw <- bind_rows(lapply(config_order, function(cfg) {
-    d <- summarize_config("Hurdle", cfg)
-    data.frame(
-      `Model type` = "Hurdle",
-      Configuration = unname(config_label_map[cfg]),
-      n = nrow(d),
-      auc_median = median(d$auc, na.rm = TRUE),
-      sensitivity_median = median(d$sensitivity, na.rm = TRUE),
-      specificity_median = median(d$specificity, na.rm = TRUE),
-      balanced_acc_median = median(d$balanced_acc, na.rm = TRUE),
-      mae_median = median(d$mae, na.rm = TRUE),
-      `AUC, median [IQR]` = fmt_iqr(d$auc, 2),
-      `% AUC>0.5` = pct_gt(d$auc, 0.5),
-      `Sensitivity, median [IQR]` = fmt_iqr(d$sensitivity, 2),
-      `Specificity, median [IQR]` = fmt_iqr(d$specificity, 2),
-      `Balanced acc. (Youden threshold), median [IQR]` = fmt_iqr(d$balanced_acc, 2),
-      `MAE, median [IQR]` = fmt_iqr(d$mae, 4),
-      check.names = FALSE
-    )
-  }))
-  cont_table <- cont_raw %>%
-    select(`Model type`, Configuration, n, `r, median [IQR]`, `% r>0`,
-           `R², median [IQR]`, `MAE, median [IQR]`, `RMSE, median [IQR]`)
-  hurdle_table <- hurdle_raw %>%
-    select(`Model type`, Configuration, n, `AUC, median [IQR]`, `% AUC>0.5`,
-           `Sensitivity, median [IQR]`, `Specificity, median [IQR]`,
-           `Balanced acc. (Youden threshold), median [IQR]`, `MAE, median [IQR]`)
-  perf_table <- bind_rows(cont_table, hurdle_table)
+common_uids <- metrics_all %>% filter(!is.na(AUC)) %>%
+  count(uid) %>% filter(n == length(CONFIGS)) %>% pull(uid)
+table_common <- make_table(metrics_all %>% filter(uid %in% common_uids))
 
-  cont_report_table <- cont_table %>% select(-`Model type`)
-  hurdle_report_table <- hurdle_table %>% select(-`Model type`)
-  cont_csv <- file.path(report_dir, sprintf("Table2_continuous_model_results_%s.csv", variant_name))
-  hurdle_csv <- file.path(report_dir, sprintf("Table3_hurdle_model_results_%s.csv", variant_name))
-  write.csv(cont_report_table, cont_csv, row.names = FALSE)
-  write.csv(hurdle_report_table, hurdle_csv, row.names = FALSE)
-  cat(sprintf("Saved report continuous table CSV: %s\n", cont_csv))
-  cat(sprintf("Saved report hurdle table CSV: %s\n", hurdle_csv))
-  invisible(perf_table)
-}
+cat(sprintf("\nCommon-sample N = %d\n", length(common_uids)))
+cat("\n--- Table: all available participants ---\n")
+print(as.data.frame(table_all))
+cat("\n--- Table: common participants across all configurations ---\n")
+print(as.data.frame(table_common))
 
-table2_predictive_performance_main <- make_predictive_performance_tables(
-  results_main, baseline_tests_main, "main", MIN_FOLDS
-)
-# Auto-detect best configs from MAIN variant
-# Best continuous config = highest MEAN R² (per request)
-auto_best_cont <- summary_main %>% filter(model_type=="Continuous", config != "Baseline") %>%
-  slice_max(mean_r2, n=1, with_ties=FALSE) %>% pull(config)
-if (length(auto_best_cont)>0)   BEST_CONT_CFG   <- auto_best_cont
-if (RUN_HURDLE_MODELS) {
-  auto_best_hurdle <- summary_main %>% filter(model_type=="Hurdle", config != "Baseline") %>%
-    slice_max(median_auc, n=1, with_ties=FALSE) %>% pull(config)
-  if (length(auto_best_hurdle)>0) BEST_HURDLE_CFG <- auto_best_hurdle
-} else {
-  BEST_HURDLE_CFG <- NA_character_
-}
-cat(sprintf("\nBest Continuous: %s | Best Hurdle: %s\n",
-            ifelse(exists("BEST_CONT_CFG"), BEST_CONT_CFG, "not run"),
-            ifelse(!is.na(BEST_HURDLE_CFG), BEST_HURDLE_CFG, "not run")))
+write.csv(table_all,    "Table_hurdle_models_all.csv",    row.names = FALSE)
+write.csv(table_common, "Table_hurdle_models_common.csv", row.names = FALSE)
+write.csv(metrics_all,  "hurdle_participant_metrics.csv", row.names = FALSE)
+write.csv(preds_all,    "hurdle_predictions.csv", row.names = FALSE)
+
+cat("\nSaved: Table_hurdle_models_all.csv, Table_hurdle_models_common.csv\n")
 # ==============================================================================
 # SECTION 4: REPORTING & VISUALIZATION
 # ==============================================================================

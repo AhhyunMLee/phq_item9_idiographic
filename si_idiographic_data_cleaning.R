@@ -1182,398 +1182,134 @@ compute_raw_passive_compliance <- function(expected_days,
 }
 
 ################################################################################
-# ANALYTIC INCLUSION + FEATURE-DROP CRITERIA  (Methods 2.4.1 / 2.4.3)
-#
-# Applied to all_features_combined.csv -> all_features_included.csv
-#
-# Drop criteria implemented:
-#   1. DROP stress entirely (sparse, unreliable).
-#   2. PARTICIPANT passive sensing data filter: mean data availability across
-#      passive streams, averaged equally across streams. SMS and calls are
-#      excluded from this threshold because they are sparse event logs.
-#      Default = 0.75, aligned with the Methods section.
-#   3. DROP feature columns whose values are ALL NA (e.g. indices never estimable
-#      — like event-based coverage, or sensors with no data).
-#   4. (optional) SI-count criterion: keep PTs with >= 10 SI-positive and
-#      >= 20 SI-negative q9 observations (Methods 2.4.1; Peduzzi/Riley).
-#
+# ANALYTIC INCLUSION + FEATURE-DROP CRITERIA
+#   all_features_combined.csv -> all_features_cleaned.csv
+#   1. drop stress                        2. EMA compliance >= 0.75
+#   3. passive compliance >= 0.75         4. SI counts (>=10 positive, >=20 zero)
+#   5. non-zero q9 variance               6. enough obs for >= 10 CV folds
+#   7. drop feature columns >50% missing
 ################################################################################
-suppressPackageStartupMessages({ library(data.table); library(stringr) })
-
 apply_inclusion_criteria <- function(
-    infile             = "all_features_combined.csv",
-    outfile            = "all_features_included.csv",
+    infile = "all_features_combined.csv",
+    outfile = "all_features_cleaned.csv",
     ema_compliance_threshold = 0.75,
     passive_data_threshold = 0.75,
-    passive_sensors    = c("acc","steps","hr","battery","gps","gps_home"),
-    drop_sensors       = c("stress"),          # dropped entirely
-    apply_ema_compliance = TRUE,
-    apply_passive_compliance = TRUE,
-    apply_si_counts    = TRUE, min_si_pos = 10, min_si_neg = 20) {
-  input_path <- file.path(CLEAN_DATA_DIR, infile)
-  cat(sprintf("Reading inclusion input: %s\n", input_path))
-  d <- data.table::fread(input_path)
-  d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  n_uid0 <- data.table::uniqueN(d$uid); n_col0 <- ncol(d)
-  cat(sprintf("Input: %d rows, %d cols, %d participants\n", nrow(d), n_col0, n_uid0))
+    passive_sensors = c("acc","steps","hr","battery","gps","gps_home"),
+    drop_sensors = c("stress"),
+    min_si_pos = 10, min_si_neg = 20,
+    min_folds = 10,
+    train_days = 45, val_days = 10, test_days = 1, ema_per_day = 3,
+    max_missing = 0.50) {
   
-  ## 1. DROP stress (and any other listed sensors) entirely -------------------
+  d <- data.table::fread(file.path(CLEAN_DATA_DIR, infile))
+  d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
+  n_uid0 <- data.table::uniqueN(d$uid)
+  cat(sprintf("Input: %d rows, %d cols, %d participants\n", nrow(d), ncol(d), n_uid0))
+  
+  # 1. drop stress (and any other listed sensors)
   for (s in drop_sensors) {
     cols <- grep(sprintf("^%s_", s), names(d), value = TRUE)
-    if (length(cols)) { d[, (cols) := NULL]; cat(sprintf("Dropped %s: %d cols\n", s, length(cols))) }
+    if (length(cols)) d[, (cols) := NULL]
   }
   
-  ## 2. EMA compliance from participant-level EMA completion rate --------------
-  keep_ema <- unique(d$uid)
-  ema_comp <- data.table::data.table(uid = unique(d$uid), ema_compliance = NA_real_)
-  if (apply_ema_compliance && "compliance" %in% names(d)) {
-    ema_comp <- d[, .(ema_compliance = max(suppressWarnings(as.numeric(compliance)), na.rm = TRUE)), by = uid]
-    ema_comp[!is.finite(ema_compliance), ema_compliance := NA_real_]
-    keep_ema <- ema_comp[!is.na(ema_compliance) & ema_compliance >= ema_compliance_threshold, uid]
-    cat(sprintf("EMA compliance >= %.0f%%: %d / %d participants kept (median compliance: %.2f)\n",
-                ema_compliance_threshold * 100, length(keep_ema), n_uid0,
-                stats::median(ema_comp$ema_compliance, na.rm = TRUE)))
-  }
+  # 2. EMA compliance (participant-level max)
+  ema_comp <- d[, .(ema_compliance = max(suppressWarnings(as.numeric(compliance)), na.rm = TRUE)), by = uid]
+  ema_comp[!is.finite(ema_compliance), ema_compliance := NA_real_]
+  keep_ema <- ema_comp[ema_compliance >= ema_compliance_threshold, uid]
   
-  ## 3. Raw/minimally processed passive sensing compliance --------------------
+  # 3. passive sensing compliance (mean across streams)
   expected_days <- unique(d[, .(uid, date = parse_date_any(date_rep))])
-  keep_cov <- unique(d$uid)
-  uid_cov <- data.table::data.table(uid = unique(d$uid), mean_cov = NA_real_)
-  uid_sensor <- data.table::data.table(uid = character(), sensor = character(),
-                                       expected_days = integer(), valid_days = integer(),
-                                       passive_compliance = numeric())
-  if (apply_passive_compliance) {
-    uid_sensor <- compute_raw_passive_compliance(
-      expected_days = expected_days,
-      passive_sensors = passive_sensors
-    )
-    uid_cov <- uid_sensor[, .(mean_cov = mean(passive_compliance, na.rm = TRUE)), by = uid]
-    keep_cov <- uid_cov[is.finite(mean_cov) & mean_cov >= passive_data_threshold, uid]
-    cat(sprintf("Raw passive sensing compliance >= %.0f%%: %d / %d participants kept (median compliance: %.2f)\n",
-                passive_data_threshold * 100, length(keep_cov), n_uid0,
-                stats::median(uid_cov$mean_cov, na.rm = TRUE)))
-  }
-  sensor_availability <- uid_sensor[, .(
-    n_participants = .N,
-    median_availability = stats::median(passive_compliance, na.rm = TRUE),
-    mean_availability = mean(passive_compliance, na.rm = TRUE),
-    n_below_75 = sum(passive_compliance < passive_data_threshold, na.rm = TRUE),
-    pct_below_75 = mean(passive_compliance < passive_data_threshold, na.rm = TRUE) * 100
-  ), by = sensor][order(-n_below_75, median_availability)]
-  cat("Raw passive sensor compliance summary (largest drop first):\n")
-  print(sensor_availability)
+  uid_sensor <- compute_raw_passive_compliance(expected_days, passive_sensors)
+  uid_cov <- uid_sensor[, .(mean_cov = mean(passive_compliance, na.rm = TRUE)), by = uid]
+  keep_cov <- uid_cov[is.finite(mean_cov) & mean_cov >= passive_data_threshold, uid]
   
-  ## 4. SI-count criterion (q9 raw 0-100; SI-positive = q9 > 0) ----------------
-  keep_si <- unique(d$uid)
-  if (apply_si_counts && "q9" %in% names(d)) {
-    si <- d[!is.na(q9), .(n_pos = sum(q9 > 0), n_neg = sum(q9 == 0)), by = uid]
-    keep_si <- si[n_pos >= min_si_pos & n_neg >= min_si_neg, uid]
-    cat(sprintf("SI counts (>=%d pos, >=%d neg): %d participants kept\n",
-                min_si_pos, min_si_neg, length(keep_si)))
-  }
+  # 4. SI counts
+  si <- d[!is.na(q9), .(n_pos = sum(q9 > 0), n_neg = sum(q9 == 0)), by = uid]
+  keep_si <- si[n_pos >= min_si_pos & n_neg >= min_si_neg, uid]
   
-  ## Participant-level inclusion breakdown ------------------------------------
-  all_uids <- sort(unique(d$uid))
-  si_counts <- if ("q9" %in% names(d)) {
-    d[!is.na(q9), .(n_si_pos = sum(q9 > 0), n_si_neg = sum(q9 == 0)), by = uid]
-  } else {
-    data.table::data.table(uid = all_uids, n_si_pos = NA_integer_, n_si_neg = NA_integer_)
-  }
-  inclusion_report <- data.table::data.table(uid = all_uids)[
-    uid_cov, on = "uid"
-  ][
-    ema_comp, on = "uid"
-  ][
-    si_counts, on = "uid"
-  ]
-  inclusion_report[, pass_ema := uid %in% keep_ema]
-  inclusion_report[, pass_passive := uid %in% keep_cov]
-  inclusion_report[, pass_si := uid %in% keep_si]
-  inclusion_report[, fail_si_positive := !is.na(n_si_pos) & n_si_pos < min_si_pos]
-  inclusion_report[, fail_si_negative := !is.na(n_si_neg) & n_si_neg < min_si_neg]
-  inclusion_report[, si_failure_reason := data.table::fcase(
-    pass_si, "pass_si_count",
-    fail_si_positive & fail_si_negative, "fail_both_si_positive_and_non_si",
-    fail_si_positive, "fail_si_positive_observations",
-    fail_si_negative, "fail_non_si_observations",
-    default = "unknown_or_missing_q9"
-  )]
-  inclusion_report[, inclusion_group := data.table::fcase(
-    pass_ema & pass_passive & pass_si, "pass_all",
-    !pass_ema & pass_passive & pass_si, "fail_ema_only",
-    pass_ema & !pass_passive & pass_si, "fail_passive_only",
-    pass_ema & pass_passive & !pass_si, "fail_si_only",
-    default = "pass_neither"
-  )]
-  breakdown <- inclusion_report[, .N, by = inclusion_group][order(inclusion_group)]
-  cat("Inclusion overlap breakdown:\n")
-  print(breakdown)
-  si_keystone <- inclusion_report[pass_ema & pass_passive, .(
-    denominator_passed_ema_passive = .N,
-    retained_after_si_count = sum(pass_si, na.rm = TRUE),
-    excluded_by_si_count = sum(!pass_si, na.rm = TRUE),
-    excluded_due_to_low_si_positive = sum(!pass_si & fail_si_positive, na.rm = TRUE),
-    excluded_due_to_low_si_positive_only = sum(!pass_si & fail_si_positive & !fail_si_negative, na.rm = TRUE),
-    excluded_due_to_low_non_si_only = sum(!pass_si & !fail_si_positive & fail_si_negative, na.rm = TRUE),
-    excluded_due_to_both_low_si_and_low_non_si = sum(!pass_si & fail_si_positive & fail_si_negative, na.rm = TRUE)
-  )]
-  si_reason_breakdown <- inclusion_report[pass_ema & pass_passive & !pass_si,
-                                          .N, by = si_failure_reason][order(-N)]
-  cat("\nKEYSTONE SI-count exclusion summary among participants who passed EMA + passive criteria:\n")
-  print(si_keystone)
-  cat("SI-count failure reason breakdown:\n")
-  print(si_reason_breakdown)
-  si_keystone_path <- file.path(results_dir, "keystone_si_count_exclusion_summary.csv")
-  data.table::fwrite(si_keystone, si_keystone_path)
-  si_reason_path <- file.path(results_dir, "keystone_si_count_failure_reasons.csv")
-  data.table::fwrite(si_reason_breakdown, si_reason_path)
-  cat(sprintf("Saved keystone SI-count summary: %s\n", si_keystone_path))
-  cat(sprintf("Saved keystone SI-count reason breakdown: %s\n", si_reason_path))
-  report_path <- file.path(results_dir, "inclusion_participant_report.csv")
-  make_dirs(dirname(report_path))
-  data.table::fwrite(inclusion_report, report_path)
-  cat(sprintf("Saved inclusion participant report: %s\n", report_path))
-  sensor_report_path <- file.path(results_dir, "passive_sensor_availability_report.csv")
-  data.table::fwrite(sensor_availability, sensor_report_path)
-  cat(sprintf("Saved passive sensor availability report: %s\n", sensor_report_path))
+  # 5. non-zero variance on the SI outcome
+  #    (implied by criterion 4, but applied explicitly to match the Methods)
+  si_var <- d[!is.na(q9), .(q9_var = stats::var(q9)), by = uid]
+  keep_var <- si_var[is.finite(q9_var) & q9_var > 0, uid]
   
-  ## intersect all participant criteria ---------------------------------------
-  keep <- Reduce(intersect, list(keep_ema, keep_cov, keep_si))
+  # 6. enough observations to yield >= min_folds valid CV folds
+  #    Each fold spans (train + val + test) days at ema_per_day prompts, and the
+  #    window slides forward one test period at a time, so:
+  #      n_folds = floor((n_obs - fold_n) / slide_n) + 1
+  #    Counts ANSWERED prompts, since rows without q9 are dropped before CV.
+  fold_n  <- (train_days + val_days + test_days) * ema_per_day   # 168
+  slide_n <- test_days * ema_per_day                             # 3
+  min_obs <- fold_n + (min_folds - 1) * slide_n                  # 195
+  n_obs_pt <- d[!is.na(q9), .(n_obs = .N), by = uid]
+  keep_obs <- n_obs_pt[n_obs >= min_obs, uid]
+  
+  # participant report (for the flow diagram)
+  report <- Reduce(function(a, b) merge(a, b, by = "uid", all = TRUE),
+                   list(ema_comp, uid_cov, si, si_var, n_obs_pt))
+  report <- data.table::as.data.table(report)
+  report[, pass_ema     := uid %in% keep_ema]
+  report[, pass_passive := uid %in% keep_cov]
+  report[, pass_si      := uid %in% keep_si]
+  report[, pass_var     := uid %in% keep_var]
+  report[, pass_folds   := uid %in% keep_obs]
+  make_dirs(results_dir)
+  data.table::fwrite(report, file.path(results_dir, "inclusion_participant_report.csv"))
+  
+  cat(sprintf("EMA >= %.0f%%: %d | passive >= %.0f%%: %d | SI counts: %d | non-zero var: %d | >=%d folds (>=%d obs): %d  (of %d PTs)\n",
+              ema_compliance_threshold * 100, length(keep_ema),
+              passive_data_threshold * 100, length(keep_cov),
+              length(keep_si), length(keep_var),
+              min_folds, min_obs, length(keep_obs), n_uid0))
+  
+  # intersect all participant criteria
+  keep <- Reduce(intersect, list(keep_ema, keep_cov, keep_si, keep_var, keep_obs))
   d <- d[uid %in% keep]
-  cat(sprintf("==> %d participants retained after all criteria\n", length(keep)))
+  cat(sprintf("==> %d participants retained\n", length(keep)))
   
-  ## 5. DROP all-NA feature columns (computed AFTER row filtering) -------------
-  id_cols  <- intersect(c("uid","ema_day","date_rep","ema_time"), names(d))
-  feat_cols <- setdiff(names(d), id_cols)
-  all_na <- feat_cols[vapply(feat_cols, function(c) all(is.na(d[[c]])), logical(1))]
-  if (length(all_na)) {
-    d[, (all_na) := NULL]
-    cat(sprintf("Dropped %d all-NA feature columns\n", length(all_na)))
+  # 7. drop feature columns >max_missing missing -------------------------------
+  #    Indices with high minimum-observation requirements (entropy N >= 250,
+  #    P90-P10 N >= 20) are often non-estimable for event-based sensors (SMS,
+  #    calls, conversation), leaving columns that are almost entirely missing.
+  #    These carry little information and, because KNN imputation needs rows
+  #    complete across all selected columns, they block imputation for the whole
+  #    feature block. Computed AFTER participant filtering so the percentages
+  #    reflect the analytic sample.
+  #    Raw EMA items are protected: q3 is asked only in the morning (~63%
+  #    missing by design, forward-filled downstream) and q9 is the outcome.
+  protected <- c("uid", "date_rep", "ema_time", "mlife_id", "compliance",
+                 "ema_timestamp", "ema_day", paste0("q", 1:9), "g1", "g2")
+  feat <- setdiff(names(d), protected)
+  pct_missing <- vapply(feat, function(cc) mean(is.na(d[[cc]])), numeric(1))
+  drop_cols <- feat[pct_missing > max_missing]
+  
+  if (length(drop_cols)) {
+    miss_report <- data.frame(column = drop_cols,
+                              pct_missing = round(100 * pct_missing[drop_cols], 1),
+                              row.names = NULL)
+    miss_report <- miss_report[order(-miss_report$pct_missing), ]
+    data.table::fwrite(miss_report,
+                       file.path(results_dir, "dropped_high_missing_columns.csv"))
+    d[, (drop_cols) := NULL]
   }
+  
+  # save in chronological order (morning -> afternoon -> evening within each day)
+  d[, .ord := match(ema_time, c("morning", "afternoon", "evening"))]
+  data.table::setorderv(d, c("uid", "date_rep", ".ord"))
+  d[, .ord := NULL]
   
   data.table::fwrite(d, file.path(CLEAN_DATA_DIR, outfile))
-  cat(sprintf("\nSaved %s: %d rows x %d cols (%d participants)\n",
-              outfile, nrow(d), ncol(d), data.table::uniqueN(d$uid)))
-  invisible(list(data = d, kept_uids = keep, coverage = uid_cov,
-                 sensor_coverage = uid_sensor,
-                 sensor_availability = sensor_availability,
-                 dropped_cols = all_na))
+  cat(sprintf("Saved %s: %d rows x %d cols (%d participants) | dropped %d cols >%.0f%% missing\n",
+              outfile, nrow(d), ncol(d), data.table::uniqueN(d$uid),
+              length(drop_cols), max_missing * 100))
+  invisible(list(data = d, kept_uids = keep, dropped_cols = drop_cols))
 }
 
-res <- apply_inclusion_criteria(
-  outfile = "all_features_included.csv"
-)
-
-make_sensor_quality_distributions <- function(
-    infile = "all_features_combined.csv",
-    out_dir = results_dir,
-    tag = tools::file_path_sans_ext(basename(infile))) {
-  
-  if (!requireNamespace("ggplot2", quietly = TRUE)) {
-    warning("ggplot2 is not installed; skipping sensor quality distribution plots.")
-    return(invisible(NULL))
-  }
-  if (!requireNamespace("scales", quietly = TRUE)) {
-    warning("scales is not installed; skipping sensor quality distribution plots.")
-    return(invisible(NULL))
-  }
-  make_dirs(out_dir)
-  
-  d <- data.table::fread(file.path(CLEAN_DATA_DIR, infile), colClasses = list(character = "uid"))
-  d[, uid := stringr::str_pad(as.character(uid), 4, pad = "0")]
-  sensor_labels <- c(
-    acc = "Accelerometer", hr = "Heart rate", steps = "Steps",
-    battery = "Battery", convo = "Conversation", gps = "GPS / location",
-    gps_home = "Time at home", sleep = "Sleep", sms = "SMS", calls = "Calls"
-  )
-  sensor_tags <- names(sensor_labels)
-  
-  sensor_cols <- function(sensor, pattern) {
-    grep(sprintf("^%s_.*%s", sensor, pattern), names(d), value = TRUE)
-  }
-  
-  value_long <- data.table::rbindlist(lapply(sensor_tags, function(sensor) {
-    cols <- if (sensor == "sleep") {
-      grep("^sleep_mean_", names(d), value = TRUE)
-    } else {
-      sensor_cols(sensor, "_mean_val$")
-    }
-    if (!length(cols)) return(NULL)
-    d[, (cols) := lapply(.SD, as.numeric), .SDcols = cols]
-    x <- data.table::melt(
-      d[, c("uid", cols), with = FALSE],
-      id.vars = "uid",
-      variable.name = "feature",
-      value.name = "value"
-    )
-    x[, sensor := sensor_labels[[sensor]]]
-    x
-  }), use.names = TRUE, fill = TRUE)
-  
-  availability_long <- data.table::rbindlist(lapply(sensor_tags, function(sensor) {
-    cov_cols <- sensor_cols(sensor, "_coverage$")
-    mean_cols <- if (sensor == "sleep") grep("^sleep_mean_", names(d), value = TRUE) else sensor_cols(sensor, "_mean_val$")
-    if (length(cov_cols)) {
-      data.table::data.table(
-        uid = d$uid,
-        sensor = sensor_labels[[sensor]],
-        availability = rowMeans(as.matrix(d[, ..cov_cols]), na.rm = TRUE)
-      )
-    } else if (length(mean_cols)) {
-      data.table::data.table(
-        uid = d$uid,
-        sensor = sensor_labels[[sensor]],
-        availability = rowMeans(!is.na(as.data.frame(d[, ..mean_cols])))
-      )
-    } else {
-      NULL
-    }
-  }), use.names = TRUE, fill = TRUE)
-  
-  summary_rows <- data.table::rbindlist(lapply(sensor_tags, function(sensor) {
-    mean_cols <- if (sensor == "sleep") grep("^sleep_mean_", names(d), value = TRUE) else sensor_cols(sensor, "_mean_val$")
-    cov_cols <- sensor_cols(sensor, "_coverage$")
-    data.table::data.table(
-      sensor = sensor_labels[[sensor]],
-      n_features = length(mean_cols),
-      n_coverage_features = length(cov_cols),
-      pct_rows_any_value = if (length(mean_cols)) {
-        mean(rowSums(!is.na(as.data.frame(d[, ..mean_cols]))) > 0) * 100
-      } else NA_real_,
-      median_availability = if (length(cov_cols)) {
-        median(rowMeans(as.matrix(d[, ..cov_cols]), na.rm = TRUE), na.rm = TRUE)
-      } else if (length(mean_cols)) {
-        median(rowMeans(!is.na(as.data.frame(d[, ..mean_cols]))), na.rm = TRUE)
-      } else NA_real_
-    )
-  }), use.names = TRUE)
-  data.table::fwrite(summary_rows, file.path(out_dir, sprintf("sensor_quality_summary_%s.csv", tag)))
-  
-  if (nrow(value_long)) {
-    value_long <- value_long[is.finite(value)]
-    if (nrow(value_long)) {
-      p_values <- ggplot2::ggplot(value_long, ggplot2::aes(x = value)) +
-        ggplot2::geom_histogram(bins = 40, fill = "#7fb5a3", color = "white") +
-        ggplot2::facet_wrap(~ sensor, scales = "free", ncol = 2) +
-        ggplot2::labs(
-          title = "Sensor feature value distributions",
-          subtitle = sprintf("%s | mean-level features across EMA rows", infile),
-          x = "Feature value",
-          y = "Rows"
-        ) +
-        ggplot2::theme_minimal(base_size = 10) +
-        ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-      ggplot2::ggsave(file.path(out_dir, sprintf("sensor_value_distributions_%s.png", tag)),
-                      p_values, width = 12, height = 14, dpi = 200, bg = "white")
-    }
-  }
-  
-  if (nrow(availability_long)) {
-    availability_long <- availability_long[is.finite(availability)]
-    p_avail <- ggplot2::ggplot(availability_long, ggplot2::aes(x = availability)) +
-      ggplot2::geom_histogram(bins = 30, fill = "#5c7a8a", color = "white") +
-      ggplot2::facet_wrap(~ sensor, scales = "free_y", ncol = 2) +
-      ggplot2::scale_x_continuous(labels = scales::label_percent()) +
-      ggplot2::labs(
-        title = "Sensor data availability distributions",
-        subtitle = sprintf("%s | coverage when available, otherwise non-missing feature proportion", infile),
-        x = "Availability",
-        y = "Rows"
-      ) +
-      ggplot2::theme_minimal(base_size = 10) +
-      ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-    ggplot2::ggsave(file.path(out_dir, sprintf("sensor_availability_distributions_%s.png", tag)),
-                    p_avail, width = 12, height = 14, dpi = 200, bg = "white")
-  }
-  
-  cat(sprintf("Saved sensor QA plots and summary to: %s\n", out_dir))
-  invisible(list(values = value_long, availability = availability_long, summary = summary_rows))
-}
-
-make_sensor_quality_distributions("all_features_combined.csv", tag = "combined")
-if (file.exists(file.path(CLEAN_DATA_DIR, "all_features_included.csv"))) {
-  make_sensor_quality_distributions("all_features_included.csv", tag = "included")
-}
-
-
-inspect_dynamic_index_merge <- function(
-    feature_file = "all_features_combined.csv",
-    out_dir = results_dir) {
-  
-  make_dirs(out_dir)
-  feature_path <- file.path(CLEAN_DATA_DIR, feature_file)
-  if (!file.exists(feature_path)) stop(sprintf("Missing feature file: %s", feature_path))
-  
-  fm <- data.table::fread(feature_path, nrows = 1)
-  combined_path <- file.path(CLEAN_DATA_DIR, "all_features_combined.csv")
-  combined_names <- if (file.exists(combined_path)) names(data.table::fread(combined_path, nrows = 1)) else character(0)
-  tags <- c("acc", "hr", "steps", "battery", "convo", "gps", "gps_home", "sleep", "sms", "calls")
-  tag_feature_count <- function(tag, nms) {
-    if (!length(nms)) return(NA_integer_)
-    pattern <- if (tag == "gps") "^gps_(?!home_)" else sprintf("^%s_", tag)
-    sum(grepl(pattern, nms, perl = TRUE))
-  }
-  expected <- data.table::rbindlist(lapply(tags, function(tag) {
-    fp <- file.path(CLEAN_SENSOR_DIR, sprintf("dynamic_indices_%s.csv", tag))
-    file_exists <- file.exists(fp)
-    n_rows <- NA_integer_
-    n_pts <- NA_integer_
-    source_cols <- 0L
-    
-    if (file_exists) {
-      src <- data.table::fread(fp, colClasses = list(character = "uid"))
-      n_rows <- nrow(src)
-      if ("uid" %in% names(src)) n_pts <- data.table::uniqueN(src$uid)
-      reshaped <- reshape_dynamic_indices(fp, tag)
-      if (!is.null(reshaped)) {
-        source_cols <- length(setdiff(names(reshaped), c("uid", "date_rep", "ema_time")))
-      }
-    }
-    
-    merged_cols <- tag_feature_count(tag, names(fm))
-    combined_cols <- tag_feature_count(tag, combined_names)
-    merge_status <- if (!file_exists) {
-      "missing_dynamic_file"
-    } else if (source_cols == 0L) {
-      "no_reshaped_columns"
-    } else if (merged_cols >= source_cols) {
-      "ok"
-    } else if (!identical(feature_file, "all_features_combined.csv") &&
-               !is.na(combined_cols) && combined_cols >= source_cols && merged_cols > 0L) {
-      "ok_after_filter_drop"
-    } else if (merged_cols > 0L) {
-      "partial"
-    } else {
-      "not_merged"
-    }
-    data.table::data.table(
-      sensor = tag,
-      dynamic_file_exists = file_exists,
-      dynamic_rows = n_rows,
-      dynamic_participants = n_pts,
-      expected_feature_columns = source_cols,
-      combined_feature_columns = combined_cols,
-      merged_feature_columns = merged_cols,
-      merge_status = merge_status
-    )
-  }), use.names = TRUE)
-  
-  out_csv <- file.path(out_dir, sprintf("dynamic_index_merge_inspection_%s.csv",
-                                        tools::file_path_sans_ext(basename(feature_file))))
-  data.table::fwrite(expected, out_csv)
-  print(expected)
-  if (any(!expected$merge_status %in% c("ok", "ok_after_filter_drop"))) {
-    warning(sprintf("Some dynamic index sources are missing or incomplete. See: %s", out_csv))
-  } else {
-    cat(sprintf("All dynamic index sources are represented in %s\n", feature_file))
-  }
-  invisible(expected)
-}
-
-inspect_dynamic_index_merge("all_features_combined.csv")
-if (file.exists(file.path(CLEAN_DATA_DIR, "all_features_included.csv"))) {
-  inspect_dynamic_index_merge("all_features_included.csv")
-}
+res <- apply_inclusion_criteria()
 
 cat("\nData cleaning complete.\n")
 
+# inspect the final cleaned data
+dat <- res$data
+View(dat)
+
+nrow(dplyr::distinct(dat, uid))
