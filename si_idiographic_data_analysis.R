@@ -1,6 +1,7 @@
 ################################################################################
 # SI Idiographic Prediction Project - Data Analysis Script
 #
+# Continuous RF model
 #   Baseline                  (predict the training mean)
 #   EMA                       (EMA mean features)
 #   EMA (dynamic)             (EMA mean + MAD features)
@@ -474,7 +475,7 @@ cat("\nSaved: Table_continuous_models_all.csv, Table_continuous_models_common.cs
 
 
 ################################################################################
-# NESTED CV MODEL COMPARISON — TWO-PART HURDLE (GBM), 7 configurations
+# TWO-PART HURDLE (GBM)
 #
 # Stage 1 (occurrence): gradient-boosted classifier for any SI (q9 > 0)
 # Stage 2 (severity)  : gradient-boosted regression on SI-positive rows only
@@ -986,8 +987,9 @@ write.csv(metrics_all,  "hurdle_participant_metrics.csv", row.names = FALSE)
 write.csv(preds_all,    "hurdle_predictions.csv", row.names = FALSE)
 
 cat("\nSaved: Table_hurdle_models_all.csv, Table_hurdle_models_common.csv\n")
+
 # ==============================================================================
-# SECTION 4: REPORTING & VISUALIZATION
+# SECTION 4: REPORTING & VISUALIZATION - TBD 
 # ==============================================================================
 cat("\n===== SECTION 5: Reporting & Visualization =====\n")
 config_levels <- c("Baseline","EMA_mean","EMA_mean_dynamic",

@@ -13,7 +13,7 @@
 #
 # The script runs top to bottom when sourced:
 #   1. shared dynamic-index helpers
-#   2. EMA processing
+#   2. EMA 
 #   3. passive sensing data
 #   4. data inspection / visualization
 ################################################################################
@@ -426,7 +426,6 @@ print(acc_res[, .(n = .N,
 
 data.table::setDTthreads(0)   # restore default threading
 ################################################################################
-
 
 ################################################################################
 # GENERIC PARALLEL SENSOR RUNNER  (hr, steps, battery, convo, gps, gps_home)
