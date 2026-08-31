@@ -3638,3 +3638,268 @@ cat(sprintf("Saved consolidated base-rate analysis CSV: %s\n", base_rate_output_
 }
 
 cat("\nSingle-file workflow complete.\n")
+
+
+setwd("/Users/ahhyun/Desktop")
+
+df <- read.csv("CSSRS_modified.csv")
+
+library(dplyr)
+
+# Participants meeting exclusion criteria _CSSRS
+excluded <- df %>%
+  filter(
+    cssrs_add_4 == 1 |
+      cssrs_add_5 == 1 |
+      cssrs_add_7 == 1
+  )
+
+# Number excluded
+n_excluded <- nrow(excluded)
+
+# Number included
+n_included <- nrow(df) - n_excluded
+
+# Print results
+cat("Excluded (high suicide risk):", n_excluded, "\n")
+cat("Included:", n_included, "\n")
+cat("Percent excluded:", round(100 * n_excluded / nrow(df), 1), "%\n")''
+
+
+################################################################################
+# EXPLORATORY SHAP FEATURE IMPORTANCE  (self-contained add-on)
+#
+# Companion to the continuous RF / hurdle GBM scripts. Reads all_features_cleaned.csv
+# plus the saved metrics CSVs, and for each above-threshold participant
+# (continuous R2>0 ; hurdle AUC>0.5) fits a participant-level random forest and
+# summarises mean absolute approximate (Monte-Carlo Shapley) SHAP importance.
+# Aggregated across participants to find the top feature, source, EMA item,
+# passive sensor, time window, and dynamic index. Exploratory and descriptive.
+# Grouped winners use per-feature-normalised importance. Configs: the three
+# dynamic sets (mean + MAD). Outputs -> 4. Results/SHAP_feature_importance/.
+################################################################################
+
+library(dplyr); library(stringr); library(tibble)
+library(caret); library(randomForest); library(data.table)
+
+CLEAN_DATA_DIR <- "/Users/ahhyun/Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction/3. Cleaned data"
+setwd(CLEAN_DATA_DIR)
+OUTCOME <- "q9"; set.seed(12361488)
+SHAP_NSIM <- 10; SHAP_MAX_ROWS <- 40; RF_NTREE <- 500; RF_MTRY_CAP <- 5
+DYNAMIC_CONFIGS <- c("EMA (dynamic)", "Passive (dynamic)", "EMA + Passive (dynamic)")
+OUT_DIR <- file.path(dirname(CLEAN_DATA_DIR), "4. Results", "SHAP_feature_importance")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ---- 1. Load data (same treatment as the model scripts) ----------------------
+dat <- data.table::fread("all_features_cleaned.csv",
+                         colClasses = list(character = "uid")) %>% as.data.frame()
+dat <- dat %>%
+  mutate(.ord = match(ema_time, c("morning", "afternoon", "evening"))) %>%
+  arrange(uid, date_rep, .ord) %>% select(-.ord) %>%
+  filter(!is.na(.data[[OUTCOME]]))
+cat(sprintf("Loaded %d rows | %d participants\n", nrow(dat), n_distinct(dat$uid)))
+
+# ---- 2. Classify feature columns (identical to the model scripts) ------------
+non_feature <- c("uid","date_rep","ema_time","mlife_id","compliance","ema_timestamp",
+                 "ema_day","q9","q1","q2","q3","q4","q5","q6","q7","q8","g1","g2")
+all_cols <- setdiff(colnames(dat), non_feature)
+all_cols <- all_cols[!grepl("(_coverage|_n_obs)$", all_cols)]
+EMA_WINDOWED_PATTERN   <- "^(q[1-9]|g[12])_(mean|mad)_d(1|7)$"
+SLEEP_PATTERN          <- "^sleep_(mean|mad)_(total_sleep|rem_sleep)_(day1|day7)$"
+PASSIVE_WINDOW_PATTERN <- "(hr1|hr4|day1|day7)"
+col_class <- tibble(col = all_cols) %>%
+  mutate(
+    is_ema_windowed = str_detect(col, regex(EMA_WINDOWED_PATTERN, ignore_case = TRUE)),
+    is_sleep        = str_detect(col, regex(SLEEP_PATTERN, ignore_case = TRUE)),
+    is_passive      = str_detect(col, regex(PASSIVE_WINDOW_PATTERN, ignore_case = TRUE)) &
+      !is_ema_windowed & !is_sleep,
+    source = case_when(is_ema_windowed ~ "ema", is_sleep ~ "passive",
+                       is_passive ~ "passive", TRUE ~ "unclassified"),
+    type = case_when(
+      is_ema_windowed & str_detect(col, "_mean_d[17]$") ~ "mean",
+      is_ema_windowed & str_detect(col, "_mad_d[17]$")  ~ "dynamic",
+      is_sleep   & str_detect(col, "^sleep_mean_") ~ "mean",
+      is_sleep   & str_detect(col, "^sleep_mad_")  ~ "dynamic",
+      is_passive & str_detect(col, regex("(_mean_val|_sum_val)$", ignore_case = TRUE)) ~ "mean",
+      is_passive & str_detect(col, regex("(_mad_val|_entropy|_p90p10)$", ignore_case = TRUE)) ~ "dynamic",
+      TRUE ~ NA_character_),
+    window = case_when(
+      is_ema_windowed ~ str_replace(str_extract(col, "d[17]$"), "^d", "day"),
+      is_sleep        ~ str_extract(col, "(day1|day7)$"),
+      is_passive      ~ str_extract(col, regex(PASSIVE_WINDOW_PATTERN, ignore_case = TRUE)),
+      TRUE ~ NA_character_),
+    sensor = case_when(
+      is_sleep   ~ paste0("sleep_", str_extract(col, "(total_sleep|rem_sleep)")),
+      is_passive ~ str_remove(col, regex(paste0("_(", PASSIVE_WINDOW_PATTERN, ")_.*$"),
+                                         ignore_case = TRUE)),
+      TRUE ~ NA_character_)
+  ) %>%
+  filter(source != "unclassified", !is.na(type), !is.na(window))
+
+sensor_labels <- c(acc="Accelerometer", hr="Heart rate", steps="Steps", convo="Conversation",
+                   gps="GPS / location", gps_home="Time at home", sms="SMS", calls="Calls",
+                   battery="Battery", sleep_total_sleep="Sleep (total)", sleep_rem_sleep="Sleep (REM)")
+ema_item_labels <- c(q1="q1: anhedonia", q2="q2: depression", q3="q3: sleep", q4="q4: fatigue",
+                     q5="q5: appetite", q6="q6: worthlessness", q7="q7: concentration",
+                     q8="q8: psychomotor", q9="q9: SI severity", g1="g1: anxiety", g2="g2: worry")
+window_labels <- c(hr1="1 hour", hr4="4 hours", day1="1 day", day7="7 days")
+lab <- function(x, tbl) ifelse(!is.na(x) & x %in% names(tbl), unname(tbl[x]), x)
+
+feature_labels <- col_class %>% transmute(
+  feature  = col,
+  source   = ifelse(source == "ema", "EMA", "Passive sensor"),
+  sensor   = lab(sensor, sensor_labels),
+  ema_item = lab(str_extract(col, "^(q[1-9]|g[12])"), ema_item_labels),
+  window   = lab(window, window_labels),
+  index    = case_when(str_detect(col, "entropy") ~ "Entropy", str_detect(col, "p90p10") ~ "P90-P10",
+                       str_detect(col, "_mad") ~ "MAD", str_detect(col, "_mean") ~ "Mean",
+                       str_detect(col, "_sum") ~ "Sum", TRUE ~ NA_character_))
+
+# Predictor set per dynamic config (all passive sensors + all windows pooled).
+cols_for <- function(src) col_class %>% filter(source == src, type %in% c("mean","dynamic")) %>% pull(col)
+config_predictors <- function(config) unique(switch(config,
+                                                    "EMA (dynamic)"           = cols_for("ema"),
+                                                    "Passive (dynamic)"       = cols_for("passive"),
+                                                    "EMA + Passive (dynamic)" = c(cols_for("ema"), cols_for("passive")),
+                                                    stop(sprintf("Unsupported config: %s", config))))
+
+# ---- 3. Helpers --------------------------------------------------------------
+drop_nzv <- function(cols, df, freqCut = 19, uniqueCut = 10) {
+  cols <- intersect(cols, names(df)); cols <- cols[vapply(cols, function(c) is.numeric(df[[c]]), logical(1))]
+  if (!length(cols)) return(character(0))
+  nzv <- tryCatch(caret::nearZeroVar(df[, cols, drop = FALSE], freqCut = freqCut, uniqueCut = uniqueCut),
+                  error = function(e) integer(0))
+  if (length(nzv)) cols[-nzv] else cols
+}
+# Monte-Carlo Shapley approximation of mean |SHAP| per feature.
+approx_mean_abs_shap <- function(object, X, pred_wrapper, nsim = SHAP_NSIM) {
+  X <- as.data.frame(X); p <- ncol(X); n <- nrow(X); if (!p || !n) return(numeric())
+  s <- setNames(rep(0, p), names(X)); k <- setNames(rep(0, p), names(X))
+  for (ii in seq_len(n)) { xi <- X[ii, , drop = FALSE]
+  for (ss in seq_len(nsim)) {
+    prev <- X[sample.int(n, 1L), , drop = FALSE]; prev_p <- pred_wrapper(object, prev)
+    for (jj in sample.int(p)) { cur <- prev; cur[[jj]] <- xi[[jj]]; cur_p <- pred_wrapper(object, cur)
+    s[[jj]] <- s[[jj]] + abs(as.numeric(cur_p - prev_p)); k[[jj]] <- k[[jj]] + 1
+    prev <- cur; prev_p <- cur_p } } }
+  s / pmax(k, 1)
+}
+fails <- list()
+fail <- function(uid, mt, cfg, reason) {
+  fails[[length(fails)+1L]] <<- data.frame(uid=as.character(uid), model_type=mt, config=cfg,
+                                           reason=reason, stringsAsFactors=FALSE); NULL }
+
+# Fit one participant's RF and return per-feature mean |approx SHAP|.
+fit_pt_importance <- function(pt, predictors, mt, cfg) {
+  uid <- if (nrow(pt)) as.character(pt$uid[1]) else NA_character_
+  pt <- pt[!is.na(pt[[OUTCOME]]), , drop = FALSE]
+  if (nrow(pt) < 10) return(fail(uid, mt, cfg, "fewer than 10 outcome rows"))
+  if (mt == "Continuous") { v <- stats::var(pt[[OUTCOME]], na.rm = TRUE)
+  if (is.na(v) || v == 0) return(fail(uid, mt, cfg, "zero outcome variance"))
+  } else if (length(unique(as.integer(pt[[OUTCOME]] > 0))) < 2)
+    return(fail(uid, mt, cfg, "only one binary class"))
+  pv <- drop_nzv(predictors, pt); if (length(pv) < 2) return(fail(uid, mt, cfg, "<2 predictors after nzv"))
+  k_use <- max(1, min(5, nrow(pt) - 1))
+  pp <- tryCatch(caret::preProcess(pt[, pv, drop=FALSE], method=c("zv","knnImpute"), k=k_use), error=function(e) NULL)
+  if (is.null(pp)) pp <- tryCatch(caret::preProcess(pt[, pv, drop=FALSE], method=c("zv","medianImpute")), error=function(e) NULL)
+  if (is.null(pp)) return(fail(uid, mt, cfg, "preProcess failed"))
+  x <- tryCatch(predict(pp, pt[, pv, drop=FALSE]), error=function(e) NULL)
+  if (is.null(x) || ncol(x) < 2) return(fail(uid, mt, cfg, "<2 predictors after imputation"))
+  if (mt == "Continuous") {
+    d <- cbind(x, .y = pt[[OUTCOME]]); names(d)[ncol(d)] <- OUTCOME
+    rf <- tryCatch(randomForest::randomForest(stats::as.formula(paste(OUTCOME, "~ .")), data=d,
+                                              mtry=min(RF_MTRY_CAP, ncol(x)), ntree=RF_NTREE), error=function(e) NULL)
+    pw <- function(o, nd) as.numeric(predict(o, newdata = nd))
+  } else {
+    d <- cbind(x, .bin = factor(ifelse(pt[[OUTCOME]] > 0, "SI", "noSI"), levels=c("noSI","SI")))
+    rf <- tryCatch(randomForest::randomForest(.bin ~ ., data=d,
+                                              mtry=min(RF_MTRY_CAP, ncol(x)), ntree=RF_NTREE), error=function(e) NULL)
+    pw <- function(o, nd) as.numeric(predict(o, newdata = nd, type = "prob")[, "SI"])
+  }
+  if (is.null(rf)) return(fail(uid, mt, cfg, "random forest failed"))
+  sx <- x; if (nrow(sx) > SHAP_MAX_ROWS) sx <- sx[sample(seq_len(nrow(sx)), SHAP_MAX_ROWS), , drop=FALSE]
+  shap <- tryCatch(approx_mean_abs_shap(rf, as.data.frame(sx), pw, SHAP_NSIM), error=function(e) NULL)
+  if (is.null(shap) || !length(shap)) return(fail(uid, mt, cfg, "approx SHAP failed"))
+  data.frame(uid=uid, feature=names(shap), importance=as.numeric(shap),
+             model_type=mt, config=cfg, stringsAsFactors=FALSE)
+}
+
+# Aggregate across participants: per-feature, and per-domain (per-feature-normalised).
+summarize_importance <- function(imp, stub) {
+  if (!nrow(imp)) return(invisible(NULL))
+  imp <- imp %>% left_join(feature_labels, by = "feature")
+  feat <- imp %>% group_by(feature) %>%
+    summarise(n_participants=n_distinct(uid), median_importance=median(importance, na.rm=TRUE),
+              mean_importance=mean(importance, na.rm=TRUE), .groups="drop") %>%
+    left_join(feature_labels, by="feature") %>% arrange(desc(median_importance))
+  grp <- function(g) imp %>% filter(!is.na(.data[[g]]), .data[[g]] != "") %>%
+    group_by(uid, level=.data[[g]], feature) %>%
+    summarise(fi=mean(importance, na.rm=TRUE), .groups="drop") %>%
+    group_by(uid, level) %>% summarise(mpf=mean(fi, na.rm=TRUE), .groups="drop") %>%
+    group_by(level) %>% summarise(n_participants=n_distinct(uid),
+                                  median_importance_per_feature=median(mpf, na.rm=TRUE),
+                                  mean_importance_per_feature=mean(mpf, na.rm=TRUE), .groups="drop") %>%
+    arrange(desc(median_importance_per_feature))
+  sums <- list(feature=feat, source=grp("source"), sensor=grp("sensor"),
+               ema_item=grp("ema_item"), window=grp("window"), index=grp("index"))
+  for (nm in names(sums))
+    write.csv(sums[[nm]], file.path(OUT_DIR, sprintf("summary_%s_%s.csv", nm, stub)), row.names=FALSE)
+  winners <- bind_rows(lapply(names(sums), function(nm) { x <- sums[[nm]]; if (!nrow(x)) return(NULL)
+  isf <- nm == "feature"
+  data.frame(model_type=imp$model_type[1], config=imp$config[1], domain=nm,
+             winner=if (isf) x$feature[1] else x$level[1],
+             median_importance=if (isf) x$median_importance[1] else x$median_importance_per_feature[1],
+             mean_importance=if (isf) x$mean_importance[1] else x$mean_importance_per_feature[1],
+             n_participants=x$n_participants[1], stringsAsFactors=FALSE) }))
+  write.csv(winners, file.path(OUT_DIR, sprintf("winners_%s.csv", stub)), row.names=FALSE)
+  winners
+}
+
+# ---- 4. Eligibility from saved metrics CSVs ----------------------------------
+rd <- function(p) { if (!file.exists(p)) stop(sprintf("Metrics file not found: %s", p))
+  data.table::fread(p, colClasses = list(character = "uid")) %>% as.data.frame() }
+cont_metrics   <- rd("model_comparison_participant_metrics.csv")
+hurdle_metrics <- rd("hurdle_participant_metrics.csv")
+eligible_uids <- function(mt, cfg) {
+  if (mt == "Continuous") cont_metrics %>% filter(Configuration==cfg, !is.na(R2), R2 > 0) %>%
+    arrange(desc(R2)) %>% pull(uid) %>% unique()
+  else hurdle_metrics %>% filter(Configuration==cfg, !is.na(AUC), AUC > 0.5) %>%
+    arrange(desc(AUC)) %>% pull(uid) %>% unique()
+}
+
+# ---- 5. Run all analyses (3 configs x 2 model types) -------------------------
+analyses <- expand.grid(model_type=c("Continuous","Hurdle"), config=DYNAMIC_CONFIGS, stringsAsFactors=FALSE)
+status_rows <- list(); winner_rows <- list()
+for (ii in seq_len(nrow(analyses))) {
+  mt <- analyses$model_type[ii]; cfg <- analyses$config[ii]
+  crit <- if (mt == "Continuous") "R2 > 0" else "AUC > 0.5"
+  stub <- sprintf("%s_%s_%s", tolower(mt),
+                  str_replace_all(str_replace_all(cfg, "[^A-Za-z0-9]+", "_"), "_+$", ""),
+                  if (mt == "Continuous") "R2gt0" else "AUCgt05")
+  cat(sprintf("\n[%s] %s | %s | %s\n", stub, mt, cfg, crit))
+  uids <- eligible_uids(mt, cfg)
+  write.csv(data.frame(uid=uids), file.path(OUT_DIR, sprintf("participants_%s.csv", stub)), row.names=FALSE)
+  predictors <- config_predictors(cfg)
+  imp <- bind_rows(lapply(uids, function(u) fit_pt_importance(dat[dat$uid == u, , drop=FALSE], predictors, mt, cfg)))
+  write.csv(imp, file.path(OUT_DIR, sprintf("importance_%s.csv", stub)), row.names=FALSE)
+  w <- summarize_importance(imp, stub)
+  if (!is.null(w)) { w$criterion <- crit; winner_rows[[stub]] <- w }
+  status_rows[[stub]] <- data.frame(model_type=mt, config=cfg, criterion=crit,
+                                    eligible_participants=length(uids), importance_rows=nrow(imp),
+                                    importance_participants=dplyr::n_distinct(imp$uid), predictor_count=length(predictors),
+                                    stringsAsFactors=FALSE)
+  cat(sprintf("  eligible=%d | importance rows=%d | PTs=%d | predictors=%d\n",
+              length(uids), nrow(imp), dplyr::n_distinct(imp$uid), length(predictors)))
+}
+
+# ---- 6. Aggregate outputs ----------------------------------------------------
+status <- bind_rows(status_rows); winners_all <- bind_rows(winner_rows); failures <- bind_rows(fails)
+if (!nrow(failures)) failures <- data.frame(uid=character(), model_type=character(),
+                                            config=character(), reason=character())
+write.csv(status,      file.path(OUT_DIR, "exploratory_feature_importance_status.csv"),   row.names=FALSE)
+write.csv(winners_all, file.path(OUT_DIR, "exploratory_feature_importance_winners.csv"),  row.names=FALSE)
+write.csv(failures,    file.path(OUT_DIR, "exploratory_feature_importance_failures.csv"), row.names=FALSE)
+cat("\n--- Run status ---\n"); print(status)
+cat("\n--- Winners ---\n")
+if (nrow(winners_all)) print(winners_all %>% select(model_type, config, domain, winner, median_importance, n_participants))
+cat(sprintf("\nSaved SHAP feature-importance outputs to:\n%s\n", OUT_DIR))
+

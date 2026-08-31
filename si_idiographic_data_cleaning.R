@@ -21,7 +21,7 @@
 # ------------------------------------------------------------------------------
 # 1) Set the working directory to the SI_Prediction project folder.
 # ------------------------------------------------------------------------------
-setwd("/Users/ahhyun/Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction")   # <-- EDIT: put the full path to your SI_Prediction folder here
+setwd("/Users/ahhyun/Library/CloudStorage/GoogleDrive-ahhyun.lee@dartmouth.edu/My Drive/SI_Prediction")  
 
 # ------------------------------------------------------------------------------
 # 2) Install any missing packages, then load them all.
