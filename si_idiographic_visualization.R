@@ -28,7 +28,7 @@ suppressPackageStartupMessages({
 # ==============================================================================
 # CONFIG  — edit paths / options; everything else is automatic
 # ==============================================================================
-DATA_DIR   <- "."
+DATA_DIR <- "/Users/ahhyun/Library/CloudStorage/GoogleDrive-ahhyun.lee-2.hse@dartmouth.edu/My Drive/SI_Prediction/4. Results/model_results"
 OUTPUT_DIR <- file.path(DATA_DIR, "figures")
 CSV <- list(
   cont_metrics = file.path(DATA_DIR, "model_comparison_participant_metrics.csv"),
@@ -48,8 +48,8 @@ TRAIN_DAYS <- 45; VAL_DAYS <- 10; EMA_PER_DAY <- 3
 PARTICIPANTS <- NULL       # NULL = every participant; or c("0300","0011")
 OVERWRITE    <- TRUE
 DPI          <- 220
-# Cosmetics (identical to the reference figures) ------------------------------
-BG_CREAM <- "#fbfaf4"; BORDER_GOLD <- "#eadb9a"
+# Cosmetics --------------------------------------------------------------------
+BG_CREAM <- "white"; BORDER_GOLD <- NA
 COL_OBS  <- "#c4514a"; COL_PRED <- "#2f6473"
 # Configuration bookkeeping ---------------------------------------------------
 CONFIG_LEVELS <- c("Baseline", "EMA", "EMA (dynamic)", "Passive",
